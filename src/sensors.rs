@@ -1,0 +1,242 @@
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sensor {
+    pub label: String,
+    pub temperature_c: f64,
+    pub high_c: Option<f64>,
+    pub critical_c: Option<f64>,
+    pub source: PathBuf,
+}
+
+pub fn discover(sysfs_root: &Path) -> io::Result<Vec<Sensor>> {
+    let hwmon = discover_hwmon(&sysfs_root.join("class/hwmon"))?;
+    if !hwmon.is_empty() {
+        return Ok(hwmon);
+    }
+
+    discover_thermal_zones(&sysfs_root.join("class/thermal"))
+}
+
+fn discover_hwmon(root: &Path) -> io::Result<Vec<Sensor>> {
+    let mut sensors = Vec::new();
+    for hwmon_dir in sorted_dirs(root)? {
+        let device_name = read_trimmed(&hwmon_dir.join("name"))
+            .map(|name| humanize(&name))
+            .unwrap_or_else(|| "Hardware sensor".to_owned());
+
+        let mut inputs: Vec<PathBuf> = fs::read_dir(&hwmon_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_temperature_input)
+            })
+            .collect();
+        inputs.sort();
+
+        for input in inputs {
+            let Some(stem) = input.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let prefix = stem.trim_end_matches("_input");
+            let Some(temperature_c) = read_temperature(&input) else {
+                continue;
+            };
+            if !(-100.0..=250.0).contains(&temperature_c) {
+                continue;
+            }
+
+            let sensor_label = read_trimmed(&hwmon_dir.join(format!("{prefix}_label")))
+                .map(|label| humanize(&label));
+            let label = match sensor_label {
+                Some(label) if !label.eq_ignore_ascii_case(&device_name) => {
+                    format!("{device_name} · {label}")
+                }
+                Some(label) => label,
+                None => device_name.clone(),
+            };
+
+            sensors.push(Sensor {
+                label,
+                temperature_c,
+                high_c: read_temperature(&hwmon_dir.join(format!("{prefix}_max"))),
+                critical_c: read_temperature(&hwmon_dir.join(format!("{prefix}_crit"))),
+                source: input,
+            });
+        }
+    }
+
+    sensors.sort_by(|left, right| left.label.cmp(&right.label));
+    Ok(sensors)
+}
+
+fn discover_thermal_zones(root: &Path) -> io::Result<Vec<Sensor>> {
+    let mut sensors = Vec::new();
+    for zone in sorted_dirs(root)? {
+        if !zone
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("thermal_zone"))
+        {
+            continue;
+        }
+
+        let input = zone.join("temp");
+        let Some(temperature_c) = read_temperature(&input) else {
+            continue;
+        };
+        if !(-100.0..=250.0).contains(&temperature_c) {
+            continue;
+        }
+
+        let label = read_trimmed(&zone.join("type"))
+            .map(|value| humanize(&value))
+            .unwrap_or_else(|| "Thermal zone".to_owned());
+        sensors.push(Sensor {
+            label,
+            temperature_c,
+            high_c: None,
+            critical_c: None,
+            source: input,
+        });
+    }
+
+    sensors.sort_by(|left, right| left.label.cmp(&right.label));
+    Ok(sensors)
+}
+
+fn sorted_dirs(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    Ok(dirs)
+}
+
+fn is_temperature_input(name: &str) -> bool {
+    let Some(index) = name
+        .strip_prefix("temp")
+        .and_then(|value| value.strip_suffix("_input"))
+    else {
+        return false;
+    };
+    !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+}
+
+fn read_temperature(path: &Path) -> Option<f64> {
+    let millidegrees = read_trimmed(path)?.parse::<f64>().ok()?;
+    Some(millidegrees / 1_000.0)
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn humanize(value: &str) -> String {
+    let words: Vec<String> = value
+        .split(['_', '-'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), characters.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        value.to_owned()
+    } else {
+        words.join(" ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("thermal-cli-test-{}-{nonce}", std::process::id()));
+            fs::create_dir_all(&path).expect("create test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn discovers_labeled_hwmon_sensors_and_thresholds() {
+        let root = TestDir::new();
+        let hwmon = root.0.join("class/hwmon/hwmon0");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(hwmon.join("name"), "coretemp\n").unwrap();
+        fs::write(hwmon.join("temp1_label"), "Package id 0\n").unwrap();
+        fs::write(hwmon.join("temp1_input"), "47500\n").unwrap();
+        fs::write(hwmon.join("temp1_max"), "80000\n").unwrap();
+        fs::write(hwmon.join("temp1_crit"), "100000\n").unwrap();
+
+        let sensors = discover(&root.0).unwrap();
+
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].label, "Coretemp · Package id 0");
+        assert_eq!(sensors[0].temperature_c, 47.5);
+        assert_eq!(sensors[0].high_c, Some(80.0));
+        assert_eq!(sensors[0].critical_c, Some(100.0));
+    }
+
+    #[test]
+    fn falls_back_to_thermal_zones() {
+        let root = TestDir::new();
+        let zone = root.0.join("class/thermal/thermal_zone0");
+        fs::create_dir_all(&zone).unwrap();
+        fs::write(zone.join("type"), "x86_pkg_temp\n").unwrap();
+        fs::write(zone.join("temp"), "52000\n").unwrap();
+
+        let sensors = discover(&root.0).unwrap();
+
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].label, "X86 Pkg Temp");
+        assert_eq!(sensors[0].temperature_c, 52.0);
+    }
+
+    #[test]
+    fn ignores_invalid_temperature_files() {
+        let root = TestDir::new();
+        let hwmon = root.0.join("class/hwmon/hwmon0");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(hwmon.join("name"), "broken\n").unwrap();
+        fs::write(hwmon.join("temp1_input"), "not-a-number\n").unwrap();
+        fs::write(hwmon.join("temp2_input"), "999000\n").unwrap();
+
+        assert!(discover(&root.0).unwrap().is_empty());
+    }
+}
