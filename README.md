@@ -18,7 +18,7 @@ A polished, dependency-light hardware temperature monitor for Linux terminals.
 - Reads standard Linux `hwmon` sensors with thermal-zone fallback
 - Uses hardware-provided high and critical thresholds when available
 - Color-coded state, temperature bars, and an at-a-glance summary
-- Live watch mode with responsive Ctrl+C handling
+- Interactive `-i` mode with live temperature deltas and trend arrows
 - Celsius and Fahrenheit output
 - Automatic color detection with `NO_COLOR` support
 - Graceful handling of unavailable or malformed sensors
@@ -38,11 +38,11 @@ cargo install --path .
 # One-time snapshot
 thermal-cli
 
-# Refresh every two seconds
-thermal-cli --watch
+# Interactive live temperatures and per-sample changes
+thermal-cli -i
 
 # Refresh every second in Fahrenheit
-thermal-cli --watch --interval 1 --fahrenheit
+thermal-cli -i --interval 1 --fahrenheit
 
 # Plain output suitable for logs
 thermal-cli --no-color
@@ -68,8 +68,9 @@ thermal-cli --daemon
 The daemon sends one overheat alert when a component enters the configured
 state. After that component cools 5 °C below the alert threshold, it sends one
 `resolved` notification. This hysteresis prevents notifications from flapping
-near the threshold. Normal and `--watch` dashboard modes never send
-notifications.
+near the threshold. Normal and interactive dashboard modes never send
+notifications. The previous `--watch` and `-w` flags remain aliases for
+`--interactive` and `-i`.
 
 The default alert level is `hot`. Failed notifications are retried after 60
 seconds by default:

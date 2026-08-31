@@ -2,6 +2,7 @@ mod alerts;
 mod display;
 pub mod sensors;
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,19 +22,25 @@ use supports_color::Stream;
     name = "thermal-cli",
     version,
     about = "Display hardware temperatures in a polished terminal dashboard",
-    after_help = "Examples:\n  thermal-cli\n  thermal-cli --watch\n  thermal-cli --watch --interval 1 --fahrenheit\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon --test-notification"
+    after_help = "Examples:\n  thermal-cli\n  thermal-cli -i\n  thermal-cli -i --interval 1 --fahrenheit\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon --test-notification"
 )]
 pub struct Args {
-    /// Continuously refresh the dashboard
-    #[arg(short, long, conflicts_with = "daemon")]
-    watch: bool,
+    /// Interactively display live temperatures and changes
+    #[arg(
+        short = 'i',
+        long,
+        visible_alias = "watch",
+        visible_short_alias = 'w',
+        conflicts_with = "daemon"
+    )]
+    interactive: bool,
 
     /// Run headless temperature alert monitoring
     #[arg(short, long)]
     daemon: bool,
 
-    /// Refresh interval in seconds (used with --watch or --daemon)
-    #[arg(short, long, default_value_t = 2.0, value_parser = parse_interval)]
+    /// Refresh interval in seconds (used with --interactive or --daemon)
+    #[arg(short = 'r', long, default_value_t = 2.0, value_parser = parse_interval)]
     interval: f64,
 
     /// Display temperatures in Fahrenheit
@@ -94,7 +101,7 @@ pub fn run_with_args(args: Args) -> Result<()> {
 
 fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
     let stdout = io::stdout();
-    let interactive = stdout.is_terminal();
+    let tty = stdout.is_terminal();
     let color = !args.no_color && supports_color::on(Stream::Stdout).is_some();
     let unit = if args.fahrenheit {
         Unit::Fahrenheit
@@ -102,7 +109,7 @@ fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
         Unit::Celsius
     };
 
-    if !args.watch {
+    if !args.interactive {
         let sensors = discover_sensors(&args.sysfs_root)?;
         println!("{}", display::render(&sensors, unit, color, hostname));
         return Ok(());
@@ -110,20 +117,29 @@ fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
 
     let running = shutdown_flag()?;
     let mut output = stdout.lock();
+    let mut previous = HashMap::new();
     while running.load(Ordering::SeqCst) {
         let sensors = discover_sensors(&args.sysfs_root)?;
-        if interactive {
+        if tty {
             write!(output, "\x1b[2J\x1b[H")?;
         }
         writeln!(
             output,
             "{}",
-            display::render(&sensors, unit, color, hostname)
+            display::render_interactive(&sensors, unit, color, hostname, &previous)
         )?;
-        if interactive {
-            writeln!(output, "  Press Ctrl+C to stop")?;
+        if tty {
+            writeln!(
+                output,
+                "  ↻ {:.1}s   Δ previous sample   Ctrl+C stop",
+                args.interval
+            )?;
         }
         output.flush()?;
+        previous = sensors
+            .iter()
+            .map(|sensor| (sensor.source.clone(), sensor.temperature_c))
+            .collect();
         sleep_interruptibly(&running, Duration::from_secs_f64(args.interval));
     }
 
@@ -265,10 +281,34 @@ mod tests {
     }
 
     #[test]
-    fn daemon_and_watch_modes_are_exclusive() {
-        assert!(Args::try_parse_from(["thermal-cli", "--watch", "--daemon"]).is_err());
+    fn daemon_and_interactive_modes_are_exclusive() {
+        assert!(Args::try_parse_from(["thermal-cli", "-i", "--daemon"]).is_err());
         assert!(Args::try_parse_from(["thermal-cli", "--test-notification"]).is_err());
         assert!(Args::try_parse_from(["thermal-cli", "--daemon", "--test-notification"]).is_ok());
+    }
+
+    #[test]
+    fn accepts_interactive_mode_and_legacy_watch_aliases() {
+        assert!(
+            Args::try_parse_from(["thermal-cli", "-i"])
+                .unwrap()
+                .interactive
+        );
+        assert!(
+            Args::try_parse_from(["thermal-cli", "--interactive"])
+                .unwrap()
+                .interactive
+        );
+        assert!(
+            Args::try_parse_from(["thermal-cli", "--watch"])
+                .unwrap()
+                .interactive
+        );
+        assert!(
+            Args::try_parse_from(["thermal-cli", "-w"])
+                .unwrap()
+                .interactive
+        );
     }
 
     #[test]

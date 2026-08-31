@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use crate::sensors::Sensor;
 
 const RESET: &str = "\x1b[0m";
@@ -44,6 +47,26 @@ impl TemperatureState {
 }
 
 pub fn render(sensors: &[Sensor], unit: Unit, color: bool, hostname: &str) -> String {
+    render_dashboard(sensors, unit, color, hostname, None)
+}
+
+pub(crate) fn render_interactive(
+    sensors: &[Sensor],
+    unit: Unit,
+    color: bool,
+    hostname: &str,
+    previous: &HashMap<PathBuf, f64>,
+) -> String {
+    render_dashboard(sensors, unit, color, hostname, Some(previous))
+}
+
+fn render_dashboard(
+    sensors: &[Sensor],
+    unit: Unit,
+    color: bool,
+    hostname: &str,
+    previous: Option<&HashMap<PathBuf, f64>>,
+) -> String {
     let mut output = String::new();
     let border = |text: &str| paint(text, CYAN, color);
     let title = paint(&format!("{:<44}", "◆  THERMAL MONITOR"), BOLD, color);
@@ -74,7 +97,7 @@ pub fn render(sensors: &[Sensor], unit: Unit, color: bool, hostname: &str) -> St
         output.push_str(&format!("{}  {}{}\n", border("│"), message, border("│")));
     } else {
         for sensor in sensors {
-            output.push_str(&render_sensor(sensor, unit, color));
+            output.push_str(&render_sensor(sensor, unit, color, previous));
             output.push('\n');
         }
     }
@@ -96,16 +119,46 @@ pub fn render(sensors: &[Sensor], unit: Unit, color: bool, hostname: &str) -> St
     output
 }
 
-fn render_sensor(sensor: &Sensor, unit: Unit, color: bool) -> String {
+fn render_sensor(
+    sensor: &Sensor,
+    unit: Unit,
+    color: bool,
+    previous: Option<&HashMap<PathBuf, f64>>,
+) -> String {
     let state = classify(sensor);
     let indicator = paint("●", state.color(), color);
-    let label = truncate(&sensor.label, 29);
-    let bar = temperature_bar(sensor.temperature_c, sensor.critical_c, 18);
-    let colored_bar = paint(&bar, state.color(), color);
     let (temperature, suffix) = convert(sensor.temperature_c, unit);
     let state_label = paint(&format!("{:<8}", state.label()), state.color(), color);
     let border = |text: &str| paint(text, CYAN, color);
 
+    if let Some(previous) = previous {
+        let label = truncate(&sensor.label, 23);
+        let bar = temperature_bar(sensor.temperature_c, sensor.critical_c, 16);
+        let colored_bar = paint(&bar, state.color(), color);
+        let trend = temperature_trend(
+            previous
+                .get(&sensor.source)
+                .map(|value| sensor.temperature_c - value),
+            unit,
+            color,
+        );
+        return format!(
+            "{}  {}  {:<23} {}  {:>6.1} {}  {}  {}  {}",
+            border("│"),
+            indicator,
+            label,
+            colored_bar,
+            temperature,
+            suffix,
+            trend,
+            state_label,
+            border("│")
+        );
+    }
+
+    let label = truncate(&sensor.label, 29);
+    let bar = temperature_bar(sensor.temperature_c, sensor.critical_c, 18);
+    let colored_bar = paint(&bar, state.color(), color);
     format!(
         "{}  {}  {:<29} {}  {:>6.1} {}  {}  {}",
         border("│"),
@@ -117,6 +170,25 @@ fn render_sensor(sensor: &Sensor, unit: Unit, color: bool) -> String {
         state_label,
         border("│")
     )
+}
+
+fn temperature_trend(delta_c: Option<f64>, unit: Unit, color: bool) -> String {
+    let Some(delta_c) = delta_c else {
+        return paint("·   --", DIM, color);
+    };
+    let delta = match unit {
+        Unit::Celsius => delta_c,
+        Unit::Fahrenheit => delta_c * 9.0 / 5.0,
+    }
+    .clamp(-99.9, 99.9);
+
+    if delta.abs() < 0.05 {
+        paint("→  0.0", DIM, color)
+    } else if delta > 0.0 {
+        paint(&format!("↑{delta:+5.1}"), RED, color)
+    } else {
+        paint(&format!("↓{delta:+5.1}"), CYAN, color)
+    }
 }
 
 pub(crate) fn classify(sensor: &Sensor) -> TemperatureState {
@@ -230,6 +302,35 @@ mod tests {
         assert!(output.contains("52.5 °C"));
         assert!(output.contains("NORMAL"));
         assert!(!output.contains("\x1b["));
+    }
+
+    #[test]
+    fn renders_temperature_change_in_interactive_mode() {
+        let current = sensor(53.5);
+        let mut previous = HashMap::new();
+        previous.insert(current.source.clone(), 52.0);
+
+        let output = render_interactive(&[current], Unit::Celsius, false, "workstation", &previous);
+
+        assert!(output.contains("↑ +1.5"));
+        assert!(output.lines().all(|line| line.chars().count() == 78));
+    }
+
+    #[test]
+    fn converts_interactive_delta_to_fahrenheit() {
+        let current = sensor(53.0);
+        let mut previous = HashMap::new();
+        previous.insert(current.source.clone(), 52.0);
+
+        let output = render_interactive(
+            &[current],
+            Unit::Fahrenheit,
+            false,
+            "workstation",
+            &previous,
+        );
+
+        assert!(output.contains("↑ +1.8"));
     }
 
     #[test]
