@@ -17,17 +17,21 @@ const CREDENTIAL_PATH: &str = "/etc/thermal-cli/serverchan-sendkey";
 pub(crate) struct Options<'a> {
     pub(crate) no_start: bool,
     pub(crate) sendkey_file: Option<&'a Path>,
-    pub(crate) sendkey: Option<&'a str>,
 }
 
 pub(crate) fn run(options: Options<'_>) -> Result<()> {
     let paths = InstallPaths::system();
     let executable = std::env::current_exe().context("failed to locate current executable")?;
-    let sendkey = load_sendkey(&paths, &options)?;
+    let sendkey = load_sendkey(&options)?;
 
     install_binary(&executable, &paths.binary)?;
-    atomic_write(&paths.credential, sendkey.as_bytes(), 0o600)?;
-    let unit = service_unit(&paths.binary, &paths.credential);
+    if let Some(sendkey) = &sendkey {
+        atomic_write(&paths.credential, sendkey.as_bytes(), 0o600)?;
+    } else {
+        remove_credential(&paths.credential)?;
+    }
+    let credential = sendkey.as_ref().map(|_| paths.credential.as_path());
+    let unit = service_unit(&paths.binary, credential);
     atomic_write(&paths.service, unit.as_bytes(), 0o644)?;
 
     systemctl(&["daemon-reload"])?;
@@ -38,6 +42,11 @@ pub(crate) fn run(options: Options<'_>) -> Result<()> {
 
     println!("Installed {}", paths.binary.display());
     println!("Installed {}", paths.service.display());
+    if sendkey.is_some() {
+        println!("ServerChan notifications enabled");
+    } else {
+        println!("Notifications disabled");
+    }
     if options.no_start {
         println!("Enabled {SERVICE_NAME}");
     } else {
@@ -62,26 +71,43 @@ impl InstallPaths {
     }
 }
 
-fn load_sendkey(paths: &InstallPaths, options: &Options<'_>) -> Result<String> {
+fn load_sendkey(options: &Options<'_>) -> Result<Option<String>> {
+    load_sendkey_with(options, || {
+        rpassword::prompt_password("ServerChan SendKey (empty disables notifications): ")
+            .context("failed to read ServerChan SendKey from terminal")
+    })
+}
+
+fn load_sendkey_with<F>(options: &Options<'_>, prompt: F) -> Result<Option<String>>
+where
+    F: FnOnce() -> Result<String>,
+{
     let value = if let Some(path) = options.sendkey_file {
         fs::read_to_string(path)
             .with_context(|| format!("failed to read SendKey from {}", path.display()))?
-    } else if let Some(sendkey) = options.sendkey.filter(|value| !value.trim().is_empty()) {
-        sendkey.to_owned()
-    } else if paths.credential.exists() {
-        fs::read_to_string(&paths.credential).with_context(|| {
-            format!(
-                "failed to read existing credential {}",
-                paths.credential.display()
-            )
-        })?
     } else {
-        bail!("no ServerChan SendKey provided; set SERVERCHAN_SENDKEY or use --sendkey-file");
+        prompt()?
     };
 
     let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Ok(None);
+    }
     ServerChan::new(&value).context("invalid ServerChan SendKey")?;
-    Ok(value)
+    Ok(Some(value))
+}
+
+fn remove_credential(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove credential {}; run install as root",
+                path.display()
+            )
+        }),
+    }
 }
 
 fn install_binary(source: &Path, destination: &Path) -> Result<()> {
@@ -163,8 +189,8 @@ fn temporary_path(destination: &Path) -> PathBuf {
     destination.with_file_name(format!(".{name}.tmp-{}", std::process::id()))
 }
 
-fn service_unit(binary: &Path, credential: &Path) -> String {
-    format!(
+fn service_unit(binary: &Path, credential: Option<&Path>) -> String {
+    let mut unit = format!(
         "[Unit]\n\
          Description=Hardware temperature monitor and notifier\n\
          Wants=network-online.target\n\
@@ -172,9 +198,17 @@ fn service_unit(binary: &Path, credential: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={} --daemon\n\
-         LoadCredential={CREDENTIAL_NAME}:{}\n\
-         Restart=on-failure\n\
+         ExecStart={} --daemon\n",
+        binary.display()
+    );
+    if let Some(credential) = credential {
+        unit.push_str(&format!(
+            "LoadCredential={CREDENTIAL_NAME}:{}\n",
+            credential.display()
+        ));
+    }
+    unit.push_str(
+        "Restart=on-failure\n\
          RestartSec=5s\n\
          NoNewPrivileges=yes\n\
          PrivateTmp=yes\n\
@@ -188,9 +222,8 @@ fn service_unit(binary: &Path, credential: &Path) -> String {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
-        binary.display(),
-        credential.display()
-    )
+    );
+    unit
 }
 
 fn systemctl(arguments: &[&str]) -> Result<()> {
@@ -240,7 +273,7 @@ mod tests {
     fn unit_runs_daemon_with_a_systemd_credential() {
         let unit = service_unit(
             Path::new("/usr/local/bin/thermal-cli"),
-            Path::new("/etc/thermal-cli/serverchan-sendkey"),
+            Some(Path::new("/etc/thermal-cli/serverchan-sendkey")),
         );
 
         assert!(unit.contains("ExecStart=/usr/local/bin/thermal-cli --daemon"));
@@ -250,6 +283,14 @@ mod tests {
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("NoNewPrivileges=yes"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn unit_omits_credential_when_notifications_are_disabled() {
+        let unit = service_unit(Path::new("/usr/local/bin/thermal-cli"), None);
+
+        assert!(unit.contains("ExecStart=/usr/local/bin/thermal-cli --daemon"));
+        assert!(!unit.contains("LoadCredential="));
     }
 
     #[test]
@@ -267,40 +308,41 @@ mod tests {
     }
 
     #[test]
-    fn loads_sendkey_from_file_before_environment_value() {
+    fn removes_existing_credential_when_notifications_are_disabled() {
         let root = TestDir::new();
-        let source = root.0.join("source");
-        fs::write(&source, "SCTfile123\n").unwrap();
-        let paths = InstallPaths {
-            binary: root.0.join("bin"),
-            service: root.0.join("service"),
-            credential: root.0.join("credential"),
-        };
-        let options = Options {
-            no_start: true,
-            sendkey_file: Some(&source),
-            sendkey: Some("SCTenvironment123"),
-        };
+        let path = root.0.join("credential");
+        fs::write(&path, "SCTold123").unwrap();
 
-        assert_eq!(load_sendkey(&paths, &options).unwrap(), "SCTfile123");
+        remove_credential(&path).unwrap();
+        remove_credential(&path).unwrap();
+
+        assert!(!path.exists());
     }
 
     #[test]
-    fn preserves_an_existing_sendkey_during_reinstall() {
+    fn loads_sendkey_from_file_without_prompting() {
         let root = TestDir::new();
-        let credential = root.0.join("credential");
-        fs::write(&credential, "SCTexisting123\n").unwrap();
-        let paths = InstallPaths {
-            binary: root.0.join("bin"),
-            service: root.0.join("service"),
-            credential,
+        let source = root.0.join("source");
+        fs::write(&source, "SCTfile123\n").unwrap();
+        let options = Options {
+            no_start: true,
+            sendkey_file: Some(&source),
         };
+
+        let value = load_sendkey_with(&options, || panic!("prompt should not be called")).unwrap();
+
+        assert_eq!(value.as_deref(), Some("SCTfile123"));
+    }
+
+    #[test]
+    fn empty_prompt_disables_notifications() {
         let options = Options {
             no_start: true,
             sendkey_file: None,
-            sendkey: None,
         };
 
-        assert_eq!(load_sendkey(&paths, &options).unwrap(), "SCTexisting123");
+        let value = load_sendkey_with(&options, || Ok("  \n".to_owned())).unwrap();
+
+        assert_eq!(value, None);
     }
 }

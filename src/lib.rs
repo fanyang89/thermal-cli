@@ -24,7 +24,7 @@ use supports_color::Stream;
     name = "thermal-cli",
     version,
     about = "Display hardware temperatures in a polished terminal dashboard",
-    after_help = "Examples:\n  thermal-cli\n  thermal-cli -i\n  thermal-cli -i --interval 1 --fahrenheit\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon --test-notification\n  sudo /path/to/thermal-cli install --sendkey-file /root/serverchan-sendkey"
+    after_help = "Examples:\n  thermal-cli\n  thermal-cli -i\n  thermal-cli -i --interval 1 --fahrenheit\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon --test-notification\n  sudo /path/to/thermal-cli install"
 )]
 pub struct Args {
     /// Interactively display live temperatures and changes
@@ -53,7 +53,7 @@ pub struct Args {
     #[arg(long)]
     no_color: bool,
 
-    /// ServerChan SendKey used by daemon mode and service installation
+    /// ServerChan SendKey used by manually started daemon mode
     #[arg(
         long,
         env = "SERVERCHAN_SENDKEY",
@@ -108,7 +108,6 @@ pub fn run_with_args(args: Args) -> Result<()> {
         return install::run(install::Options {
             no_start: options.no_start,
             sendkey_file: options.sendkey_file.as_deref(),
-            sendkey: args.serverchan_sendkey.as_deref(),
         });
     }
 
@@ -179,9 +178,6 @@ fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
 fn run_daemon(args: &Args, hostname: &str) -> Result<()> {
     let sendkey = configured_sendkey(args.serverchan_sendkey.as_deref())?;
     let dispatcher = notification_dispatcher(sendkey.as_deref())?;
-    if dispatcher.is_empty() {
-        bail!("no daemon notification channel configured; set SERVERCHAN_SENDKEY");
-    }
     if args.test_notification {
         return send_test_notification(&dispatcher, hostname);
     }
@@ -191,15 +187,20 @@ fn run_daemon(args: &Args, hostname: &str) -> Result<()> {
         args.notify_level,
         Duration::from_secs(args.notify_retry_interval),
     );
-    eprintln!("thermal-cli daemon started");
+    if dispatcher.is_empty() {
+        eprintln!("thermal-cli daemon started; notifications disabled");
+    } else {
+        eprintln!("thermal-cli daemon started; notifications enabled");
+    }
 
     while running.load(Ordering::SeqCst) {
         match discover_sensors(&args.sysfs_root) {
-            Ok(sensors) => {
+            Ok(sensors) if !dispatcher.is_empty() => {
                 for delivery in alerts.process(&dispatcher, &sensors, hostname) {
                     report_delivery(&delivery);
                 }
             }
+            Ok(_) => {}
             Err(error) => eprintln!("warning: {error:#}"),
         }
         sleep_interruptibly(&running, Duration::from_secs_f64(args.interval));
@@ -253,6 +254,9 @@ fn notification_dispatcher(sendkey: Option<&str>) -> Result<Dispatcher> {
 }
 
 fn send_test_notification(dispatcher: &Dispatcher, hostname: &str) -> Result<()> {
+    if dispatcher.is_empty() {
+        bail!("notifications are disabled; configure a ServerChan SendKey first");
+    }
     let report = dispatcher.send(&alerts::test_notification(hostname));
     if !report.failures.is_empty() {
         let failures = report
@@ -402,6 +406,15 @@ mod tests {
     #[test]
     fn ignores_an_empty_serverchan_environment_value() {
         assert!(notification_dispatcher(Some("  ")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_notification_reports_when_notifications_are_disabled() {
+        let dispatcher = Dispatcher::new();
+
+        let error = send_test_notification(&dispatcher, "host").unwrap_err();
+
+        assert!(error.to_string().contains("notifications are disabled"));
     }
 
     #[test]

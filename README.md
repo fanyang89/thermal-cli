@@ -34,26 +34,30 @@ cargo install --path .
 
 ### systemd service
 
-Create a temporary key file and run the installer as root:
+Run the installer as root. It prompts for the ServerChan SendKey without
+echoing it to the terminal:
 
 ```sh
-umask 077
-printf '%s\n' "$SERVERCHAN_SENDKEY" > "$HOME/serverchan-sendkey"
-sudo "$(command -v thermal-cli)" install --sendkey-file "$HOME/serverchan-sendkey"
-rm "$HOME/serverchan-sendkey"
+sudo "$(command -v thermal-cli)" install
+# ServerChan SendKey (empty disables notifications):
 ```
+
+Press Enter without entering a key to install the daemon with notifications
+disabled. For non-interactive automation, provide a raw key file with
+`--sendkey-file PATH`; an empty file also disables notifications.
 
 The installer:
 
 - Copies the running executable to `/usr/local/bin/thermal-cli`
-- Stores the SendKey at `/etc/thermal-cli/serverchan-sendkey` with mode `0600`
+- Stores a provided SendKey at `/etc/thermal-cli/serverchan-sendkey` with mode `0600`
 - Installs and hardens `/etc/systemd/system/thermal-cli.service`
 - Enables and starts the service
 
 Use `--no-start` to enable the service without starting it. Re-running
-`thermal-cli install` upgrades the binary and preserves the installed SendKey
-when no new key is supplied. The unit passes the key through systemd's
-`LoadCredential=` mechanism rather than a process environment variable.
+`thermal-cli install` upgrades the binary and prompts for the notification
+setting again. Empty input removes any installed SendKey. When notifications
+are enabled, the unit passes the key through systemd's `LoadCredential=`
+mechanism rather than a process environment variable.
 
 ## Usage
 
@@ -75,8 +79,10 @@ Run `thermal-cli --help` for all options.
 
 ## Push notifications
 
-Push delivery is active only in headless daemon mode. Set a ServerChan Turbo
-(`SCT...`) or ServerChan³ (`sctp...`) SendKey through the environment:
+Push delivery is active only in headless daemon mode. Without a SendKey, the
+daemon continues running with notifications disabled. For manual daemon runs,
+set a ServerChan Turbo (`SCT...`) or ServerChan³ (`sctp...`) SendKey through
+the environment:
 
 ```sh
 export SERVERCHAN_SENDKEY='SCT...'

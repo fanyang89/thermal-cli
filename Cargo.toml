@@ -17,4 +17,5 @@ clap = { version = "4.5", features = ["derive", "env"] }
 ctrlc = "3.4"
 hostname = "0.4"
 push-notify = { path = "crates/push-notify" }
+rpassword = "7.5"
 supports-color = "3.0"
