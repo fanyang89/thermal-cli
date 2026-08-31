@@ -1,8 +1,10 @@
 mod alerts;
 mod display;
+mod install;
 pub mod sensors;
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,7 +14,7 @@ use std::time::Duration;
 
 use alerts::{AlertDelivery, AlertKind, AlertTracker, NotifyLevel};
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use display::Unit;
 use push_notify::{Dispatcher, ServerChan};
 use supports_color::Stream;
@@ -22,7 +24,7 @@ use supports_color::Stream;
     name = "thermal-cli",
     version,
     about = "Display hardware temperatures in a polished terminal dashboard",
-    after_help = "Examples:\n  thermal-cli\n  thermal-cli -i\n  thermal-cli -i --interval 1 --fahrenheit\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon --test-notification"
+    after_help = "Examples:\n  thermal-cli\n  thermal-cli -i\n  thermal-cli -i --interval 1 --fahrenheit\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon --test-notification\n  sudo /path/to/thermal-cli install --sendkey-file /root/serverchan-sendkey"
 )]
 pub struct Args {
     /// Interactively display live temperatures and changes
@@ -51,7 +53,7 @@ pub struct Args {
     #[arg(long)]
     no_color: bool,
 
-    /// ServerChan SendKey used only in daemon mode
+    /// ServerChan SendKey used by daemon mode and service installation
     #[arg(
         long,
         env = "SERVERCHAN_SENDKEY",
@@ -75,6 +77,26 @@ pub struct Args {
     /// Override the sysfs root (useful for containers and testing)
     #[arg(long, default_value = "/sys", hide = true)]
     sysfs_root: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Install and enable the systemd daemon service
+    Install(InstallArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct InstallArgs {
+    /// Read the raw ServerChan SendKey from this file
+    #[arg(long, value_name = "PATH")]
+    sendkey_file: Option<PathBuf>,
+
+    /// Enable the service without starting it
+    #[arg(long)]
+    no_start: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -82,6 +104,14 @@ pub fn run() -> Result<()> {
 }
 
 pub fn run_with_args(args: Args) -> Result<()> {
+    if let Some(Commands::Install(options)) = &args.command {
+        return install::run(install::Options {
+            no_start: options.no_start,
+            sendkey_file: options.sendkey_file.as_deref(),
+            sendkey: args.serverchan_sendkey.as_deref(),
+        });
+    }
+
     let hostname = hostname::get()
         .unwrap_or_default()
         .to_string_lossy()
@@ -147,7 +177,8 @@ fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
 }
 
 fn run_daemon(args: &Args, hostname: &str) -> Result<()> {
-    let dispatcher = notification_dispatcher(args.serverchan_sendkey.as_deref())?;
+    let sendkey = configured_sendkey(args.serverchan_sendkey.as_deref())?;
+    let dispatcher = notification_dispatcher(sendkey.as_deref())?;
     if dispatcher.is_empty() {
         bail!("no daemon notification channel configured; set SERVERCHAN_SENDKEY");
     }
@@ -193,6 +224,24 @@ fn shutdown_flag() -> Result<Arc<AtomicBool>> {
     ctrlc::set_handler(move || signal_flag.store(false, Ordering::SeqCst))
         .context("failed to install Ctrl+C handler")?;
     Ok(running)
+}
+
+fn configured_sendkey(value: Option<&str>) -> Result<Option<String>> {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        return Ok(Some(value.trim().to_owned()));
+    }
+    let Some(directory) = std::env::var_os("CREDENTIALS_DIRECTORY") else {
+        return Ok(None);
+    };
+    read_systemd_credential(Path::new(&directory))
+}
+
+fn read_systemd_credential(directory: &Path) -> Result<Option<String>> {
+    let path = directory.join(install::CREDENTIAL_NAME);
+    let value = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read systemd credential {}", path.display()))?;
+    let value = value.trim();
+    Ok((!value.is_empty()).then(|| value.to_owned()))
 }
 
 fn notification_dispatcher(sendkey: Option<&str>) -> Result<Dispatcher> {
@@ -281,6 +330,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_install_subcommand() {
+        let args = Args::try_parse_from([
+            "thermal-cli",
+            "install",
+            "--sendkey-file",
+            "/root/serverchan-sendkey",
+            "--no-start",
+        ])
+        .unwrap();
+
+        let Some(Commands::Install(options)) = args.command else {
+            panic!("install command was not parsed");
+        };
+        assert_eq!(
+            options.sendkey_file,
+            Some(PathBuf::from("/root/serverchan-sendkey"))
+        );
+        assert!(options.no_start);
+    }
+
+    #[test]
     fn daemon_and_interactive_modes_are_exclusive() {
         assert!(Args::try_parse_from(["thermal-cli", "-i", "--daemon"]).is_err());
         assert!(Args::try_parse_from(["thermal-cli", "--test-notification"]).is_err());
@@ -332,5 +402,28 @@ mod tests {
     #[test]
     fn ignores_an_empty_serverchan_environment_value() {
         assert!(notification_dispatcher(Some("  ")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reads_serverchan_sendkey_from_systemd_credentials() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "thermal-cli-credential-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(install::CREDENTIAL_NAME),
+            "SCTcredential123\n",
+        )
+        .unwrap();
+
+        let value = read_systemd_credential(&directory).unwrap();
+
+        fs::remove_dir_all(directory).unwrap();
+        assert_eq!(value.as_deref(), Some("SCTcredential123"));
     }
 }

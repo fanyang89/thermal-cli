@@ -32,6 +32,29 @@ A polished, dependency-light hardware temperature monitor for Linux terminals.
 cargo install --path .
 ```
 
+### systemd service
+
+Create a temporary key file and run the installer as root:
+
+```sh
+umask 077
+printf '%s\n' "$SERVERCHAN_SENDKEY" > "$HOME/serverchan-sendkey"
+sudo "$(command -v thermal-cli)" install --sendkey-file "$HOME/serverchan-sendkey"
+rm "$HOME/serverchan-sendkey"
+```
+
+The installer:
+
+- Copies the running executable to `/usr/local/bin/thermal-cli`
+- Stores the SendKey at `/etc/thermal-cli/serverchan-sendkey` with mode `0600`
+- Installs and hardens `/etc/systemd/system/thermal-cli.service`
+- Enables and starts the service
+
+Use `--no-start` to enable the service without starting it. Re-running
+`thermal-cli install` upgrades the binary and preserves the installed SendKey
+when no new key is supplied. The unit passes the key through systemd's
+`LoadCredential=` mechanism rather than a process environment variable.
+
 ## Usage
 
 ```sh
@@ -80,14 +103,8 @@ thermal-cli --daemon --notify-level critical --notify-retry-interval 120
 ```
 
 Daemon mode remains in the foreground so it works correctly with systemd,
-runit, or another process supervisor. For example:
-
-```ini
-[Service]
-EnvironmentFile=/etc/thermal-cli.env
-ExecStart=/usr/local/bin/thermal-cli --daemon
-Restart=on-failure
-```
+runit, or another process supervisor. Use `thermal-cli install` to install the
+systemd service.
 
 SendKeys are never included in delivery errors. Prefer the environment variable
 over `--serverchan-sendkey` to avoid storing credentials in shell history.
