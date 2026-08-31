@@ -2,13 +2,62 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensorKind {
+    Cpu,
+    Storage,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sensor {
     pub label: String,
+    pub kind: SensorKind,
     pub temperature_c: f64,
     pub high_c: Option<f64>,
     pub critical_c: Option<f64>,
+    pub alarm: bool,
     pub source: PathBuf,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ThrottleCounters {
+    pub core_events: u64,
+    pub package_events: u64,
+}
+
+impl ThrottleCounters {
+    pub fn increased_since(self, previous: Self) -> bool {
+        self.core_events > previous.core_events || self.package_events > previous.package_events
+    }
+}
+
+pub fn throttle_counters(sysfs_root: &Path) -> ThrottleCounters {
+    let mut counters = ThrottleCounters::default();
+    let cpu_root = sysfs_root.join("devices/system/cpu");
+    let Ok(entries) = fs::read_dir(cpu_root) else {
+        return counters;
+    };
+    for cpu in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+        let is_cpu = cpu
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("cpu"))
+            .is_some_and(|index| {
+                !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+            });
+        if !is_cpu {
+            continue;
+        }
+        let throttle = cpu.join("thermal_throttle");
+        counters.core_events = counters
+            .core_events
+            .saturating_add(read_counter(&throttle.join("core_throttle_count")));
+        counters.package_events = counters
+            .package_events
+            .saturating_add(read_counter(&throttle.join("package_throttle_count")));
+    }
+    counters
 }
 
 pub fn discover(sysfs_root: &Path) -> io::Result<Vec<Sensor>> {
@@ -23,9 +72,10 @@ pub fn discover(sysfs_root: &Path) -> io::Result<Vec<Sensor>> {
 fn discover_hwmon(root: &Path) -> io::Result<Vec<Sensor>> {
     let mut sensors = Vec::new();
     for hwmon_dir in sorted_dirs(root)? {
-        let device_name = read_trimmed(&hwmon_dir.join("name"))
-            .map(|name| humanize(&name))
-            .unwrap_or_else(|| "Hardware sensor".to_owned());
+        let raw_device_name =
+            read_trimmed(&hwmon_dir.join("name")).unwrap_or_else(|| "hardware_sensor".to_owned());
+        let kind = sensor_kind(&raw_device_name);
+        let device_name = humanize(&raw_device_name);
 
         let mut inputs: Vec<PathBuf> = fs::read_dir(&hwmon_dir)
             .into_iter()
@@ -64,9 +114,11 @@ fn discover_hwmon(root: &Path) -> io::Result<Vec<Sensor>> {
 
             sensors.push(Sensor {
                 label,
+                kind,
                 temperature_c,
                 high_c: read_temperature(&hwmon_dir.join(format!("{prefix}_max"))),
                 critical_c: read_temperature(&hwmon_dir.join(format!("{prefix}_crit"))),
+                alarm: read_alarm(&hwmon_dir, prefix),
                 source: input,
             });
         }
@@ -95,14 +147,16 @@ fn discover_thermal_zones(root: &Path) -> io::Result<Vec<Sensor>> {
             continue;
         }
 
-        let label = read_trimmed(&zone.join("type"))
-            .map(|value| humanize(&value))
-            .unwrap_or_else(|| "Thermal zone".to_owned());
+        let raw_type =
+            read_trimmed(&zone.join("type")).unwrap_or_else(|| "thermal_zone".to_owned());
+        let label = humanize(&raw_type);
         sensors.push(Sensor {
             label,
+            kind: sensor_kind(&raw_type),
             temperature_c,
             high_c: None,
             critical_c: None,
+            alarm: false,
             source: input,
         });
     }
@@ -134,6 +188,40 @@ fn is_temperature_input(name: &str) -> bool {
         return false;
     };
     !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+}
+
+fn sensor_kind(name: &str) -> SensorKind {
+    let name = name.to_ascii_lowercase();
+    if [
+        "coretemp",
+        "k10temp",
+        "zenpower",
+        "cpu_thermal",
+        "cpu-thermal",
+        "x86_pkg_temp",
+        "soc_thermal",
+    ]
+    .iter()
+    .any(|candidate| name.contains(candidate))
+    {
+        SensorKind::Cpu
+    } else if name.contains("nvme") || name.contains("drivetemp") {
+        SensorKind::Storage
+    } else {
+        SensorKind::Other
+    }
+}
+
+fn read_alarm(directory: &Path, prefix: &str) -> bool {
+    ["crit_alarm", "max_alarm"]
+        .iter()
+        .any(|suffix| read_counter(&directory.join(format!("{prefix}_{suffix}"))) > 0)
+}
+
+fn read_counter(path: &Path) -> u64 {
+    read_trimmed(path)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 fn read_temperature(path: &Path) -> Option<f64> {
@@ -203,14 +291,17 @@ mod tests {
         fs::write(hwmon.join("temp1_input"), "47500\n").unwrap();
         fs::write(hwmon.join("temp1_max"), "80000\n").unwrap();
         fs::write(hwmon.join("temp1_crit"), "100000\n").unwrap();
+        fs::write(hwmon.join("temp1_crit_alarm"), "1\n").unwrap();
 
         let sensors = discover(&root.0).unwrap();
 
         assert_eq!(sensors.len(), 1);
         assert_eq!(sensors[0].label, "Coretemp · Package id 0");
+        assert_eq!(sensors[0].kind, SensorKind::Cpu);
         assert_eq!(sensors[0].temperature_c, 47.5);
         assert_eq!(sensors[0].high_c, Some(80.0));
         assert_eq!(sensors[0].critical_c, Some(100.0));
+        assert!(sensors[0].alarm);
     }
 
     #[test]
@@ -225,7 +316,29 @@ mod tests {
 
         assert_eq!(sensors.len(), 1);
         assert_eq!(sensors[0].label, "X86 Pkg Temp");
+        assert_eq!(sensors[0].kind, SensorKind::Cpu);
         assert_eq!(sensors[0].temperature_c, 52.0);
+    }
+
+    #[test]
+    fn detects_increasing_cpu_throttle_counters() {
+        let root = TestDir::new();
+        let throttle0 = root.0.join("devices/system/cpu/cpu0/thermal_throttle");
+        let throttle1 = root.0.join("devices/system/cpu/cpu1/thermal_throttle");
+        fs::create_dir_all(&throttle0).unwrap();
+        fs::create_dir_all(&throttle1).unwrap();
+        fs::write(throttle0.join("core_throttle_count"), "2\n").unwrap();
+        fs::write(throttle0.join("package_throttle_count"), "5\n").unwrap();
+        fs::write(throttle1.join("core_throttle_count"), "3\n").unwrap();
+        fs::write(throttle1.join("package_throttle_count"), "7\n").unwrap();
+
+        let previous = throttle_counters(&root.0);
+        fs::write(throttle1.join("core_throttle_count"), "4\n").unwrap();
+        let current = throttle_counters(&root.0);
+
+        assert_eq!(previous.core_events, 5);
+        assert_eq!(previous.package_events, 12);
+        assert!(current.increased_since(previous));
     }
 
     #[test]

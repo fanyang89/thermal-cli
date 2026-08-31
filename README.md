@@ -16,9 +16,10 @@ A polished, dependency-light hardware temperature monitor for Linux terminals.
 ## Features
 
 - Reads standard Linux `hwmon` sensors with thermal-zone fallback
-- Uses hardware-provided high and critical thresholds when available
+- Uses hardware thresholds while avoiding emergency limits as routine warnings
+- CPU defaults: 70 °C `WARM`, 85 °C `HOT`, hardware limit `CRITICAL`
 - Color-coded state, temperature bars, and an at-a-glance summary
-- Interactive `-i` mode with live temperature deltas and trend arrows
+- Interactive `-i` mode with deltas, session maximum, and throttle detection
 - Celsius and Fahrenheit output
 - Automatic color detection with `NO_COLOR` support
 - Graceful handling of unavailable or malformed sensors
@@ -95,11 +96,11 @@ thermal-cli --daemon
 ```
 
 The daemon sends one overheat alert when a component enters the configured
-state. After that component cools 5 °C below the alert threshold, it sends one
-`resolved` notification. This hysteresis prevents notifications from flapping
-near the threshold. Normal and interactive dashboard modes never send
-notifications. The previous `--watch` and `-w` flags remain aliases for
-`--interactive` and `-i`.
+state or the kernel thermal-throttle counter increases. After that component
+cools 5 °C below the alert threshold, it sends one `resolved` notification.
+This hysteresis prevents notifications from flapping near the threshold.
+Normal and interactive dashboard modes never send notifications. The previous
+`--watch` and `-w` flags remain aliases for `--interactive` and `-i`.
 
 The default alert level is `hot`. Failed notifications are retried after 60
 seconds by default:

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::sensors::Sensor;
+use crate::sensors::{Sensor, SensorKind};
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -16,6 +16,12 @@ const BRIGHT_RED: &str = "\x1b[91m";
 pub enum Unit {
     Celsius,
     Fahrenheit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SessionPeak {
+    pub(crate) label: String,
+    pub(crate) temperature_c: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,7 +53,7 @@ impl TemperatureState {
 }
 
 pub fn render(sensors: &[Sensor], unit: Unit, color: bool, hostname: &str) -> String {
-    render_dashboard(sensors, unit, color, hostname, None)
+    render_dashboard(sensors, unit, color, hostname, None, None, false)
 }
 
 pub(crate) fn render_interactive(
@@ -56,8 +62,18 @@ pub(crate) fn render_interactive(
     color: bool,
     hostname: &str,
     previous: &HashMap<PathBuf, f64>,
+    peak: Option<&SessionPeak>,
+    throttled: bool,
 ) -> String {
-    render_dashboard(sensors, unit, color, hostname, Some(previous))
+    render_dashboard(
+        sensors,
+        unit,
+        color,
+        hostname,
+        Some(previous),
+        peak,
+        throttled,
+    )
 }
 
 fn render_dashboard(
@@ -66,6 +82,8 @@ fn render_dashboard(
     color: bool,
     hostname: &str,
     previous: Option<&HashMap<PathBuf, f64>>,
+    peak: Option<&SessionPeak>,
+    throttled: bool,
 ) -> String {
     let mut output = String::new();
     let border = |text: &str| paint(text, CYAN, color);
@@ -106,11 +124,16 @@ fn render_dashboard(
         "├────────────────────────────────────────────────────────────────────────────┤",
     ));
     output.push('\n');
-    let summary = summary(sensors, unit);
+    let summary = if previous.is_some() {
+        interactive_summary(peak, unit, throttled)
+    } else {
+        summary(sensors, unit)
+    };
+    let summary = format!("{:<74}", truncate(&summary, 74));
     output.push_str(&format!(
         "{}  {}{}\n",
         border("│"),
-        paint(&format!("{summary:<74}"), DIM, color),
+        paint(&summary, if throttled { BRIGHT_RED } else { DIM }, color),
         border("│")
     ));
     output.push_str(&border(
@@ -192,7 +215,7 @@ fn temperature_trend(delta_c: Option<f64>, unit: Unit, color: bool) -> String {
 }
 
 pub(crate) fn classify(sensor: &Sensor) -> TemperatureState {
-    if sensor.temperature_c >= threshold_for(sensor, TemperatureState::Critical) {
+    if sensor.alarm || sensor.temperature_c >= threshold_for(sensor, TemperatureState::Critical) {
         TemperatureState::Critical
     } else if sensor.temperature_c >= threshold_for(sensor, TemperatureState::Hot) {
         TemperatureState::Hot
@@ -204,11 +227,31 @@ pub(crate) fn classify(sensor: &Sensor) -> TemperatureState {
 }
 
 pub(crate) fn threshold_for(sensor: &Sensor, state: TemperatureState) -> f64 {
-    let critical = sensor.critical_c.unwrap_or(95.0);
-    let hot = sensor.high_c.unwrap_or(80.0).min(critical - 1.0);
+    let critical = sensor.critical_c.unwrap_or(match sensor.kind {
+        SensorKind::Cpu => 105.0,
+        SensorKind::Storage => 90.0,
+        SensorKind::Other => 95.0,
+    });
+    let default_hot = match sensor.kind {
+        SensorKind::Cpu => 85.0,
+        SensorKind::Storage => 75.0,
+        SensorKind::Other => 80.0,
+    };
+    // Some drivers expose the emergency limit as both max and crit. Such a
+    // value is not a useful early-warning threshold.
+    let hot = sensor
+        .high_c
+        .filter(|high| *high < critical - 1.0)
+        .unwrap_or(default_hot)
+        .min(critical - 5.0);
+    let default_warm = match sensor.kind {
+        SensorKind::Cpu => 70.0,
+        SensorKind::Storage => 60.0,
+        SensorKind::Other => (hot - 15.0).max(50.0),
+    };
     match state {
         TemperatureState::Normal => f64::NEG_INFINITY,
-        TemperatureState::Warm => (hot - 15.0).max(50.0),
+        TemperatureState::Warm => default_warm.min(hot - 5.0),
         TemperatureState::Hot => hot,
         TemperatureState::Critical => critical,
     }
@@ -225,6 +268,20 @@ fn convert(temperature_c: f64, unit: Unit) -> (f64, &'static str) {
     match unit {
         Unit::Celsius => (temperature_c, "°C"),
         Unit::Fahrenheit => (temperature_c * 9.0 / 5.0 + 32.0, "°F"),
+    }
+}
+
+fn interactive_summary(peak: Option<&SessionPeak>, unit: Unit, throttled: bool) -> String {
+    let prefix = if throttled { "⚠ THROTTLED  ·  " } else { "" };
+    match peak {
+        Some(peak) => {
+            let (temperature, suffix) = convert(peak.temperature_c, unit);
+            format!(
+                "{prefix}Session max: {} ({temperature:.1} {suffix})",
+                truncate(&peak.label, if throttled { 30 } else { 45 })
+            )
+        }
+        None => format!("{prefix}Waiting for temperature samples"),
     }
 }
 
@@ -272,9 +329,11 @@ mod tests {
     fn sensor(temperature_c: f64) -> Sensor {
         Sensor {
             label: "CPU Package".to_owned(),
+            kind: SensorKind::Cpu,
             temperature_c,
             high_c: Some(80.0),
             critical_c: Some(100.0),
+            alarm: false,
             source: PathBuf::from("/sys/test"),
         }
     }
@@ -285,6 +344,29 @@ mod tests {
         assert_eq!(classify(&sensor(70.0)), TemperatureState::Warm);
         assert_eq!(classify(&sensor(85.0)), TemperatureState::Hot);
         assert_eq!(classify(&sensor(101.0)), TemperatureState::Critical);
+    }
+
+    #[test]
+    fn uses_early_warning_thresholds_when_cpu_max_equals_critical() {
+        let mut cpu = sensor(69.0);
+        cpu.high_c = Some(105.0);
+        cpu.critical_c = Some(105.0);
+
+        assert_eq!(classify(&cpu), TemperatureState::Normal);
+        cpu.temperature_c = 70.0;
+        assert_eq!(classify(&cpu), TemperatureState::Warm);
+        cpu.temperature_c = 85.0;
+        assert_eq!(classify(&cpu), TemperatureState::Hot);
+        cpu.temperature_c = 105.0;
+        assert_eq!(classify(&cpu), TemperatureState::Critical);
+    }
+
+    #[test]
+    fn reports_a_hardware_alarm_as_critical() {
+        let mut cpu = sensor(45.0);
+        cpu.alarm = true;
+
+        assert_eq!(classify(&cpu), TemperatureState::Critical);
     }
 
     #[test]
@@ -310,9 +392,23 @@ mod tests {
         let mut previous = HashMap::new();
         previous.insert(current.source.clone(), 52.0);
 
-        let output = render_interactive(&[current], Unit::Celsius, false, "workstation", &previous);
+        let peak = SessionPeak {
+            label: "CPU Package".to_owned(),
+            temperature_c: 87.0,
+        };
+        let output = render_interactive(
+            &[current],
+            Unit::Celsius,
+            false,
+            "workstation",
+            &previous,
+            Some(&peak),
+            true,
+        );
 
         assert!(output.contains("↑ +1.5"));
+        assert!(output.contains("THROTTLED"));
+        assert!(output.contains("Session max: CPU Package (87.0 °C)"));
         assert!(output.lines().all(|line| line.chars().count() == 78));
     }
 
@@ -328,6 +424,8 @@ mod tests {
             false,
             "workstation",
             &previous,
+            None,
+            false,
         );
 
         assert!(output.contains("↑ +1.8"));

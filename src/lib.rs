@@ -15,7 +15,7 @@ use std::time::Duration;
 use alerts::{AlertDelivery, AlertKind, AlertTracker, NotifyLevel};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use display::Unit;
+use display::{SessionPeak, Unit};
 use push_notify::{Dispatcher, ServerChan};
 use supports_color::Stream;
 
@@ -147,15 +147,41 @@ fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
     let running = shutdown_flag()?;
     let mut output = stdout.lock();
     let mut previous = HashMap::new();
+    let mut previous_throttle = None;
+    let mut throttled_since_start = false;
+    let mut session_peak: Option<SessionPeak> = None;
     while running.load(Ordering::SeqCst) {
         let sensors = discover_sensors(&args.sysfs_root)?;
+        let throttle = sensors::throttle_counters(&args.sysfs_root);
+        throttled_since_start |=
+            previous_throttle.is_some_and(|previous| throttle.increased_since(previous));
+        previous_throttle = Some(throttle);
+        for sensor in &sensors {
+            if session_peak
+                .as_ref()
+                .is_none_or(|peak| sensor.temperature_c > peak.temperature_c)
+            {
+                session_peak = Some(SessionPeak {
+                    label: sensor.label.clone(),
+                    temperature_c: sensor.temperature_c,
+                });
+            }
+        }
         if tty {
             write!(output, "\x1b[2J\x1b[H")?;
         }
         writeln!(
             output,
             "{}",
-            display::render_interactive(&sensors, unit, color, hostname, &previous)
+            display::render_interactive(
+                &sensors,
+                unit,
+                color,
+                hostname,
+                &previous,
+                session_peak.as_ref(),
+                throttled_since_start,
+            )
         )?;
         if tty {
             writeln!(
@@ -192,11 +218,16 @@ fn run_daemon(args: &Args, hostname: &str) -> Result<()> {
     } else {
         eprintln!("thermal-cli daemon started; notifications enabled");
     }
+    let mut previous_throttle = None;
 
     while running.load(Ordering::SeqCst) {
         match discover_sensors(&args.sysfs_root) {
             Ok(sensors) if !dispatcher.is_empty() => {
-                for delivery in alerts.process(&dispatcher, &sensors, hostname) {
+                let throttle = sensors::throttle_counters(&args.sysfs_root);
+                let throttled =
+                    previous_throttle.is_some_and(|previous| throttle.increased_since(previous));
+                previous_throttle = Some(throttle);
+                for delivery in alerts.process(&dispatcher, &sensors, hostname, throttled) {
                     report_delivery(&delivery);
                 }
             }

@@ -6,7 +6,7 @@ use clap::ValueEnum;
 use push_notify::{DeliveryReport, Dispatcher, Notification};
 
 use crate::display::{TemperatureState, classify, threshold_for};
-use crate::sensors::Sensor;
+use crate::sensors::{Sensor, SensorKind};
 
 const RESOLVE_HYSTERESIS_C: f64 = 5.0;
 
@@ -66,8 +66,9 @@ impl AlertTracker {
         dispatcher: &Dispatcher,
         sensors: &[Sensor],
         hostname: &str,
+        throttled: bool,
     ) -> Vec<AlertDelivery> {
-        self.process_at(dispatcher, sensors, hostname, Instant::now())
+        self.process_at(dispatcher, sensors, hostname, Instant::now(), throttled)
     }
 
     fn process_at(
@@ -76,6 +77,7 @@ impl AlertTracker {
         sensors: &[Sensor],
         hostname: &str,
         now: Instant,
+        throttled: bool,
     ) -> Vec<AlertDelivery> {
         if self.retry_not_before.is_some_and(|retry_at| now < retry_at) {
             return Vec::new();
@@ -85,19 +87,40 @@ impl AlertTracker {
             .iter()
             .map(|sensor| (&sensor.source, sensor))
             .collect();
-        let overheated: Vec<Sensor> = sensors
+        let mut overheated: Vec<Sensor> = sensors
             .iter()
             .filter(|sensor| {
                 classify(sensor) >= self.minimum && !self.active.contains_key(&sensor.source)
             })
             .cloned()
             .collect();
+        let has_cpu_alert = overheated
+            .iter()
+            .any(|sensor| sensor.kind == SensorKind::Cpu)
+            || self
+                .active
+                .values()
+                .any(|sensor| sensor.kind == SensorKind::Cpu);
+        if throttled
+            && !has_cpu_alert
+            && let Some(sensor) = sensors
+                .iter()
+                .filter(|sensor| {
+                    sensor.kind == SensorKind::Cpu && !self.active.contains_key(&sensor.source)
+                })
+                .max_by(|left, right| left.temperature_c.total_cmp(&right.temperature_c))
+        {
+            overheated.push(sensor.clone());
+        }
         let mut resolved: Vec<Sensor> = self
             .active
             .keys()
             .filter_map(|source| current.get(source).copied())
             .filter(|sensor| {
-                sensor.temperature_c <= threshold_for(sensor, self.minimum) - RESOLVE_HYSTERESIS_C
+                !sensor.alarm
+                    && !(throttled && sensor.kind == SensorKind::Cpu)
+                    && sensor.temperature_c
+                        <= threshold_for(sensor, self.minimum) - RESOLVE_HYSTERESIS_C
             })
             .cloned()
             .collect();
@@ -111,6 +134,7 @@ impl AlertTracker {
                 AlertKind::Overheated,
                 &overheated,
                 hostname,
+                throttled,
             ));
             if report.delivered.is_empty() {
                 failed = true;
@@ -131,6 +155,7 @@ impl AlertTracker {
                 AlertKind::Resolved,
                 &resolved,
                 hostname,
+                false,
             ));
             if report.delivered.is_empty() {
                 failed = true;
@@ -161,13 +186,21 @@ pub(crate) fn test_notification(hostname: &str) -> Notification {
     )
 }
 
-fn build_notification(kind: AlertKind, sensors: &[Sensor], hostname: &str) -> Notification {
-    let (title_prefix, introduction) = match kind {
-        AlertKind::Overheated => (
+fn build_notification(
+    kind: AlertKind,
+    sensors: &[Sensor],
+    hostname: &str,
+    throttled: bool,
+) -> Notification {
+    let (title_prefix, introduction) = match (kind, throttled) {
+        (AlertKind::Overheated, true) => {
+            ("Thermal throttle", "CPU thermal throttling was detected.")
+        }
+        (AlertKind::Overheated, false) => (
             "Thermal alert",
             "One or more hardware components are overheating.",
         ),
-        AlertKind::Resolved => (
+        (AlertKind::Resolved, _) => (
             "Thermal resolved",
             "Hardware temperatures returned below the alert threshold.",
         ),
@@ -246,9 +279,11 @@ mod tests {
     fn sensor(temperature_c: f64) -> Sensor {
         Sensor {
             label: "CPU Package".to_owned(),
+            kind: SensorKind::Cpu,
             temperature_c,
             high_c: Some(80.0),
             critical_c: Some(100.0),
+            alarm: false,
             source: PathBuf::from("/sys/test"),
         }
     }
@@ -260,24 +295,27 @@ mod tests {
         let mut tracker = AlertTracker::new(NotifyLevel::Hot, Duration::from_secs(60));
         let start = Instant::now();
 
-        let overheat = tracker.process_at(&dispatcher, &[sensor(85.0)], "host", start);
+        let overheat = tracker.process_at(&dispatcher, &[sensor(85.0)], "host", start, false);
         let unchanged = tracker.process_at(
             &dispatcher,
             &[sensor(90.0)],
             "host",
             start + Duration::from_secs(1),
+            false,
         );
         let within_hysteresis = tracker.process_at(
             &dispatcher,
             &[sensor(78.0)],
             "host",
             start + Duration::from_secs(2),
+            false,
         );
         let resolved = tracker.process_at(
             &dispatcher,
             &[sensor(74.0)],
             "host",
             start + Duration::from_secs(3),
+            false,
         );
 
         assert_eq!(overheat.len(), 1);
@@ -299,9 +337,14 @@ mod tests {
         let mut tracker = AlertTracker::new(NotifyLevel::Hot, Duration::from_secs(60));
         let start = Instant::now();
 
-        tracker.process_at(&dispatcher, &[sensor(85.0)], "host", start);
-        let deliveries =
-            tracker.process_at(&dispatcher, &[], "host", start + Duration::from_secs(1));
+        tracker.process_at(&dispatcher, &[sensor(85.0)], "host", start, false);
+        let deliveries = tracker.process_at(
+            &dispatcher,
+            &[],
+            "host",
+            start + Duration::from_secs(1),
+            false,
+        );
 
         assert!(deliveries.is_empty());
         assert_eq!(received.lock().unwrap().len(), 1);
@@ -314,24 +357,50 @@ mod tests {
         let mut tracker = AlertTracker::new(NotifyLevel::Hot, Duration::from_secs(60));
         let start = Instant::now();
 
-        let first = tracker.process_at(&dispatcher, &[sensor(85.0)], "host", start);
+        let first = tracker.process_at(&dispatcher, &[sensor(85.0)], "host", start, false);
         let throttled = tracker.process_at(
             &dispatcher,
             &[sensor(85.0)],
             "host",
             start + Duration::from_secs(59),
+            false,
         );
         let retry = tracker.process_at(
             &dispatcher,
             &[sensor(85.0)],
             "host",
             start + Duration::from_secs(60),
+            false,
         );
 
         assert_eq!(first.len(), 1);
         assert!(throttled.is_empty());
         assert_eq!(retry.len(), 1);
         assert_eq!(received.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sends_alert_when_cpu_throttling_counter_increases() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = dispatcher(&received, false);
+        let mut tracker = AlertTracker::new(NotifyLevel::Hot, Duration::from_secs(60));
+        let start = Instant::now();
+
+        let alert = tracker.process_at(&dispatcher, &[sensor(45.0)], "host", start, true);
+        let resolved = tracker.process_at(
+            &dispatcher,
+            &[sensor(45.0)],
+            "host",
+            start + Duration::from_secs(1),
+            false,
+        );
+
+        assert_eq!(alert.len(), 1);
+        assert_eq!(resolved.len(), 1);
+        let notifications = received.lock().unwrap();
+        assert!(notifications[0].title().starts_with("Thermal throttle"));
+        assert!(notifications[0].body().contains("thermal throttling"));
+        assert!(notifications[1].title().starts_with("Thermal resolved"));
     }
 
     #[test]
@@ -342,7 +411,7 @@ mod tests {
 
         assert!(
             tracker
-                .process(&dispatcher, &[sensor(70.0)], "host")
+                .process(&dispatcher, &[sensor(70.0)], "host", false)
                 .is_empty()
         );
         assert!(received.lock().unwrap().is_empty());
@@ -352,7 +421,7 @@ mod tests {
     fn escapes_markdown_table_content() {
         let mut value = sensor(101.0);
         value.label = "CPU|`Package".to_owned();
-        let notification = build_notification(AlertKind::Overheated, &[value], "host|`name");
+        let notification = build_notification(AlertKind::Overheated, &[value], "host|`name", false);
 
         assert!(notification.body().contains("host\\|'name"));
         assert!(
