@@ -15,8 +15,8 @@ pub enum Unit {
     Fahrenheit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TemperatureState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TemperatureState {
     Normal,
     Warm,
     Hot,
@@ -24,7 +24,7 @@ enum TemperatureState {
 }
 
 impl TemperatureState {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Normal => "NORMAL",
             Self::Warm => "WARM",
@@ -119,7 +119,7 @@ fn render_sensor(sensor: &Sensor, unit: Unit, color: bool) -> String {
     )
 }
 
-fn classify(sensor: &Sensor) -> TemperatureState {
+pub(crate) fn classify(sensor: &Sensor) -> TemperatureState {
     let critical = sensor.critical_c.unwrap_or(95.0);
     let hot = sensor.high_c.unwrap_or(80.0).min(critical - 1.0);
     let warm = (hot - 15.0).max(50.0);

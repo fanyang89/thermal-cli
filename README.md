@@ -22,6 +22,8 @@ A polished, dependency-light hardware temperature monitor for Linux terminals.
 - Celsius and Fahrenheit output
 - Automatic color detection with `NO_COLOR` support
 - Graceful handling of unavailable or malformed sensors
+- ServerChan temperature alerts with configurable severity and cooldown
+- Extensible notification channels through the `push-notify` crate
 
 ## Install
 
@@ -46,6 +48,35 @@ thermal-cli --no-color
 ```
 
 Run `thermal-cli --help` for all options.
+
+## Push notifications
+
+Set a ServerChan Turbo (`SCT...`) or ServerChan³ (`sctp...`) SendKey through
+the environment, then verify delivery:
+
+```sh
+export SERVERCHAN_SENDKEY='SCT...'
+thermal-cli --test-notification
+```
+
+Enable alerts during normal or watch-mode runs:
+
+```sh
+# Notify on HOT or CRITICAL temperatures, at most once every 10 minutes
+thermal-cli --watch --notify-level hot --notify-cooldown 600
+```
+
+The default notification level is `critical`, and the default cooldown is 900
+seconds. SendKeys are never included in delivery errors. Prefer the environment
+variable over `--serverchan-sendkey` to avoid storing credentials in shell
+history.
+
+### Adding another channel
+
+The local `push-notify` crate keeps providers independent from the temperature
+monitor. Implement `push_notify::Channel`, then register the implementation
+with `push_notify::Dispatcher`. The dispatcher attempts every registered
+channel even when another channel fails.
 
 ## Platform support
 
