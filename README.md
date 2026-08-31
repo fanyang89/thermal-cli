@@ -22,7 +22,8 @@ A polished, dependency-light hardware temperature monitor for Linux terminals.
 - Celsius and Fahrenheit output
 - Automatic color detection with `NO_COLOR` support
 - Graceful handling of unavailable or malformed sensors
-- ServerChan temperature alerts with configurable severity and cooldown
+- Daemon-only ServerChan alerts with per-component overheat and resolved events
+- Configurable alert severity and failed-delivery retry interval
 - Extensible notification channels through the `push-notify` crate
 
 ## Install
@@ -51,25 +52,44 @@ Run `thermal-cli --help` for all options.
 
 ## Push notifications
 
-Set a ServerChan Turbo (`SCT...`) or ServerChan³ (`sctp...`) SendKey through
-the environment, then verify delivery:
+Push delivery is active only in headless daemon mode. Set a ServerChan Turbo
+(`SCT...`) or ServerChan³ (`sctp...`) SendKey through the environment:
 
 ```sh
 export SERVERCHAN_SENDKEY='SCT...'
-thermal-cli --test-notification
+
+# Verify delivery from daemon mode
+thermal-cli --daemon --test-notification
+
+# Monitor continuously without rendering the dashboard
+thermal-cli --daemon
 ```
 
-Enable alerts during normal or watch-mode runs:
+The daemon sends one overheat alert when a component enters the configured
+state. After that component cools 5 °C below the alert threshold, it sends one
+`resolved` notification. This hysteresis prevents notifications from flapping
+near the threshold. Normal and `--watch` dashboard modes never send
+notifications.
+
+The default alert level is `hot`. Failed notifications are retried after 60
+seconds by default:
 
 ```sh
-# Notify on HOT or CRITICAL temperatures, at most once every 10 minutes
-thermal-cli --watch --notify-level hot --notify-cooldown 600
+thermal-cli --daemon --notify-level critical --notify-retry-interval 120
 ```
 
-The default notification level is `critical`, and the default cooldown is 900
-seconds. SendKeys are never included in delivery errors. Prefer the environment
-variable over `--serverchan-sendkey` to avoid storing credentials in shell
-history.
+Daemon mode remains in the foreground so it works correctly with systemd,
+runit, or another process supervisor. For example:
+
+```ini
+[Service]
+EnvironmentFile=/etc/thermal-cli.env
+ExecStart=/usr/local/bin/thermal-cli --daemon
+Restart=on-failure
+```
+
+SendKeys are never included in delivery errors. Prefer the environment variable
+over `--serverchan-sendkey` to avoid storing credentials in shell history.
 
 ### Adding another channel
 

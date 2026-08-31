@@ -120,18 +120,25 @@ fn render_sensor(sensor: &Sensor, unit: Unit, color: bool) -> String {
 }
 
 pub(crate) fn classify(sensor: &Sensor) -> TemperatureState {
-    let critical = sensor.critical_c.unwrap_or(95.0);
-    let hot = sensor.high_c.unwrap_or(80.0).min(critical - 1.0);
-    let warm = (hot - 15.0).max(50.0);
-
-    if sensor.temperature_c >= critical {
+    if sensor.temperature_c >= threshold_for(sensor, TemperatureState::Critical) {
         TemperatureState::Critical
-    } else if sensor.temperature_c >= hot {
+    } else if sensor.temperature_c >= threshold_for(sensor, TemperatureState::Hot) {
         TemperatureState::Hot
-    } else if sensor.temperature_c >= warm {
+    } else if sensor.temperature_c >= threshold_for(sensor, TemperatureState::Warm) {
         TemperatureState::Warm
     } else {
         TemperatureState::Normal
+    }
+}
+
+pub(crate) fn threshold_for(sensor: &Sensor, state: TemperatureState) -> f64 {
+    let critical = sensor.critical_c.unwrap_or(95.0);
+    let hot = sensor.high_c.unwrap_or(80.0).min(critical - 1.0);
+    match state {
+        TemperatureState::Normal => f64::NEG_INFINITY,
+        TemperatureState::Warm => (hot - 15.0).max(50.0),
+        TemperatureState::Hot => hot,
+        TemperatureState::Critical => critical,
     }
 }
 

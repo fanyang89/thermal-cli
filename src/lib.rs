@@ -3,17 +3,17 @@ mod display;
 pub mod sensors;
 
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use alerts::{AlertTracker, NotifyLevel};
+use alerts::{AlertDelivery, AlertKind, AlertTracker, NotifyLevel};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use display::Unit;
-use push_notify::{DeliveryReport, Dispatcher, ServerChan};
+use push_notify::{Dispatcher, ServerChan};
 use supports_color::Stream;
 
 #[derive(Debug, Parser)]
@@ -21,14 +21,18 @@ use supports_color::Stream;
     name = "thermal-cli",
     version,
     about = "Display hardware temperatures in a polished terminal dashboard",
-    after_help = "Examples:\n  thermal-cli\n  thermal-cli --watch\n  thermal-cli --watch --interval 1 --fahrenheit\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --test-notification"
+    after_help = "Examples:\n  thermal-cli\n  thermal-cli --watch\n  thermal-cli --watch --interval 1 --fahrenheit\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon\n  SERVERCHAN_SENDKEY=SCT... thermal-cli --daemon --test-notification"
 )]
 pub struct Args {
     /// Continuously refresh the dashboard
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "daemon")]
     watch: bool,
 
-    /// Refresh interval in seconds (used with --watch)
+    /// Run headless temperature alert monitoring
+    #[arg(short, long)]
+    daemon: bool,
+
+    /// Refresh interval in seconds (used with --watch or --daemon)
     #[arg(short, long, default_value_t = 2.0, value_parser = parse_interval)]
     interval: f64,
 
@@ -40,7 +44,7 @@ pub struct Args {
     #[arg(long)]
     no_color: bool,
 
-    /// ServerChan SendKey (prefer the SERVERCHAN_SENDKEY environment variable)
+    /// ServerChan SendKey used only in daemon mode
     #[arg(
         long,
         env = "SERVERCHAN_SENDKEY",
@@ -49,16 +53,16 @@ pub struct Args {
     )]
     serverchan_sendkey: Option<String>,
 
-    /// Minimum temperature state that triggers a notification
-    #[arg(long, value_enum, default_value_t = NotifyLevel::Critical)]
+    /// Minimum temperature state that triggers a daemon alert
+    #[arg(long, value_enum, default_value_t = NotifyLevel::Hot)]
     notify_level: NotifyLevel,
 
-    /// Minimum seconds between notification attempts
-    #[arg(long, default_value_t = 900, value_parser = parse_cooldown)]
-    notify_cooldown: u64,
+    /// Seconds before retrying a failed notification
+    #[arg(long, default_value_t = 60, value_parser = parse_retry_interval)]
+    notify_retry_interval: u64,
 
-    /// Send a test notification and exit
-    #[arg(long)]
+    /// Send a daemon-mode test notification and exit
+    #[arg(long, requires = "daemon")]
     test_notification: bool,
 
     /// Override the sysfs root (useful for containers and testing)
@@ -71,14 +75,6 @@ pub fn run() -> Result<()> {
 }
 
 pub fn run_with_args(args: Args) -> Result<()> {
-    let stdout = io::stdout();
-    let interactive = stdout.is_terminal();
-    let color = !args.no_color && supports_color::on(Stream::Stdout).is_some();
-    let unit = if args.fahrenheit {
-        Unit::Fahrenheit
-    } else {
-        Unit::Celsius
-    };
     let hostname = hostname::get()
         .unwrap_or_default()
         .to_string_lossy()
@@ -88,55 +84,99 @@ pub fn run_with_args(args: Args) -> Result<()> {
     } else {
         hostname
     };
-    let dispatcher = notification_dispatcher(args.serverchan_sendkey.as_deref())?;
-    if args.test_notification {
-        return send_test_notification(&dispatcher, &hostname);
+
+    if args.daemon {
+        return run_daemon(&args, &hostname);
     }
-    let mut alerts =
-        AlertTracker::new(args.notify_level, Duration::from_secs(args.notify_cooldown));
+
+    run_dashboard(&args, &hostname)
+}
+
+fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
+    let stdout = io::stdout();
+    let interactive = stdout.is_terminal();
+    let color = !args.no_color && supports_color::on(Stream::Stdout).is_some();
+    let unit = if args.fahrenheit {
+        Unit::Fahrenheit
+    } else {
+        Unit::Celsius
+    };
 
     if !args.watch {
-        let sensors = sensors::discover(&args.sysfs_root).with_context(|| {
-            format!(
-                "failed to read temperature sensors from {}",
-                args.sysfs_root.display()
-            )
-        })?;
-        println!("{}", display::render(&sensors, unit, color, &hostname));
-        send_alert_if_due(&mut alerts, &dispatcher, &sensors, &hostname);
+        let sensors = discover_sensors(&args.sysfs_root)?;
+        println!("{}", display::render(&sensors, unit, color, hostname));
         return Ok(());
     }
 
-    let running = Arc::new(AtomicBool::new(true));
-    let signal_flag = Arc::clone(&running);
-    ctrlc::set_handler(move || signal_flag.store(false, Ordering::SeqCst))
-        .context("failed to install Ctrl+C handler")?;
-
+    let running = shutdown_flag()?;
     let mut output = stdout.lock();
     while running.load(Ordering::SeqCst) {
-        let sensors = sensors::discover(&args.sysfs_root).with_context(|| {
-            format!(
-                "failed to read temperature sensors from {}",
-                args.sysfs_root.display()
-            )
-        })?;
+        let sensors = discover_sensors(&args.sysfs_root)?;
         if interactive {
             write!(output, "\x1b[2J\x1b[H")?;
         }
         writeln!(
             output,
             "{}",
-            display::render(&sensors, unit, color, &hostname)
+            display::render(&sensors, unit, color, hostname)
         )?;
         if interactive {
             writeln!(output, "  Press Ctrl+C to stop")?;
         }
         output.flush()?;
-        send_alert_if_due(&mut alerts, &dispatcher, &sensors, &hostname);
         sleep_interruptibly(&running, Duration::from_secs_f64(args.interval));
     }
 
     Ok(())
+}
+
+fn run_daemon(args: &Args, hostname: &str) -> Result<()> {
+    let dispatcher = notification_dispatcher(args.serverchan_sendkey.as_deref())?;
+    if dispatcher.is_empty() {
+        bail!("no daemon notification channel configured; set SERVERCHAN_SENDKEY");
+    }
+    if args.test_notification {
+        return send_test_notification(&dispatcher, hostname);
+    }
+
+    let running = shutdown_flag()?;
+    let mut alerts = AlertTracker::new(
+        args.notify_level,
+        Duration::from_secs(args.notify_retry_interval),
+    );
+    eprintln!("thermal-cli daemon started");
+
+    while running.load(Ordering::SeqCst) {
+        match discover_sensors(&args.sysfs_root) {
+            Ok(sensors) => {
+                for delivery in alerts.process(&dispatcher, &sensors, hostname) {
+                    report_delivery(&delivery);
+                }
+            }
+            Err(error) => eprintln!("warning: {error:#}"),
+        }
+        sleep_interruptibly(&running, Duration::from_secs_f64(args.interval));
+    }
+
+    eprintln!("thermal-cli daemon stopped");
+    Ok(())
+}
+
+fn discover_sensors(sysfs_root: &Path) -> Result<Vec<sensors::Sensor>> {
+    sensors::discover(sysfs_root).with_context(|| {
+        format!(
+            "failed to read temperature sensors from {}",
+            sysfs_root.display()
+        )
+    })
+}
+
+fn shutdown_flag() -> Result<Arc<AtomicBool>> {
+    let running = Arc::new(AtomicBool::new(true));
+    let signal_flag = Arc::clone(&running);
+    ctrlc::set_handler(move || signal_flag.store(false, Ordering::SeqCst))
+        .context("failed to install Ctrl+C handler")?;
+    Ok(running)
 }
 
 fn notification_dispatcher(sendkey: Option<&str>) -> Result<Dispatcher> {
@@ -148,9 +188,6 @@ fn notification_dispatcher(sendkey: Option<&str>) -> Result<Dispatcher> {
 }
 
 fn send_test_notification(dispatcher: &Dispatcher, hostname: &str) -> Result<()> {
-    if dispatcher.is_empty() {
-        bail!("no notification channel configured; set SERVERCHAN_SENDKEY");
-    }
     let report = dispatcher.send(&alerts::test_notification(hostname));
     if !report.failures.is_empty() {
         let failures = report
@@ -168,24 +205,23 @@ fn send_test_notification(dispatcher: &Dispatcher, hostname: &str) -> Result<()>
     Ok(())
 }
 
-fn send_alert_if_due(
-    alerts: &mut AlertTracker,
-    dispatcher: &Dispatcher,
-    sensors: &[sensors::Sensor],
-    hostname: &str,
-) {
-    if dispatcher.is_empty() {
-        return;
-    }
-    if let Some(report) = alerts.send_if_due(dispatcher, sensors, hostname) {
-        report_failures(&report);
-    }
-}
-
-fn report_failures(report: &DeliveryReport) {
-    for error in &report.failures {
+fn report_delivery(delivery: &AlertDelivery) {
+    for error in &delivery.report.failures {
         eprintln!("warning: {error}");
     }
+    if delivery.report.delivered.is_empty() {
+        return;
+    }
+
+    let event = match delivery.kind {
+        AlertKind::Overheated => "overheat alert",
+        AlertKind::Resolved => "resolved notice",
+    };
+    eprintln!(
+        "{event} sent via {}: {}",
+        delivery.report.delivered.join(", "),
+        delivery.sensor_labels.join(", ")
+    );
 }
 
 fn parse_interval(value: &str) -> Result<f64, String> {
@@ -198,12 +234,12 @@ fn parse_interval(value: &str) -> Result<f64, String> {
     Ok(seconds)
 }
 
-fn parse_cooldown(value: &str) -> Result<u64, String> {
+fn parse_retry_interval(value: &str) -> Result<u64, String> {
     let seconds = value
         .parse::<u64>()
-        .map_err(|_| "cooldown must be a whole number".to_owned())?;
+        .map_err(|_| "retry interval must be a whole number".to_owned())?;
     if !(1..=86_400).contains(&seconds) {
-        return Err("cooldown must be between 1 and 86400 seconds".to_owned());
+        return Err("retry interval must be between 1 and 86400 seconds".to_owned());
     }
     Ok(seconds)
 }
@@ -229,6 +265,13 @@ mod tests {
     }
 
     #[test]
+    fn daemon_and_watch_modes_are_exclusive() {
+        assert!(Args::try_parse_from(["thermal-cli", "--watch", "--daemon"]).is_err());
+        assert!(Args::try_parse_from(["thermal-cli", "--test-notification"]).is_err());
+        assert!(Args::try_parse_from(["thermal-cli", "--daemon", "--test-notification"]).is_ok());
+    }
+
+    #[test]
     fn validates_refresh_interval() {
         assert_eq!(parse_interval("0.2"), Ok(0.2));
         assert_eq!(parse_interval("3600"), Ok(3600.0));
@@ -238,12 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn validates_notification_cooldown() {
-        assert_eq!(parse_cooldown("1"), Ok(1));
-        assert_eq!(parse_cooldown("86400"), Ok(86_400));
-        assert!(parse_cooldown("0").is_err());
-        assert!(parse_cooldown("86401").is_err());
-        assert!(parse_cooldown("1.5").is_err());
+    fn validates_notification_retry_interval() {
+        assert_eq!(parse_retry_interval("1"), Ok(1));
+        assert_eq!(parse_retry_interval("86400"), Ok(86_400));
+        assert!(parse_retry_interval("0").is_err());
+        assert!(parse_retry_interval("86401").is_err());
+        assert!(parse_retry_interval("1.5").is_err());
     }
 
     #[test]

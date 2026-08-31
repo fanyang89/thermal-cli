@@ -1,10 +1,14 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use push_notify::{DeliveryReport, Dispatcher, Notification};
 
-use crate::display::{TemperatureState, classify};
+use crate::display::{TemperatureState, classify, threshold_for};
 use crate::sensors::Sensor;
+
+const RESOLVE_HYSTERESIS_C: f64 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum NotifyLevel {
@@ -23,52 +27,127 @@ impl NotifyLevel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlertKind {
+    Overheated,
+    Resolved,
+}
+
+pub(crate) struct AlertDelivery {
+    pub(crate) kind: AlertKind,
+    pub(crate) sensor_labels: Vec<String>,
+    pub(crate) report: DeliveryReport,
+}
+
+/// Tracks per-component alert state.
+///
+/// A component becomes active only after at least one channel accepts its
+/// overheat notification. It remains active until a resolved notification is
+/// delivered after the component cools below the configured alert level.
 pub(crate) struct AlertTracker {
     minimum: TemperatureState,
-    cooldown: Duration,
-    last_attempt: Option<Instant>,
+    retry_interval: Duration,
+    active: HashMap<PathBuf, Sensor>,
+    retry_not_before: Option<Instant>,
 }
 
 impl AlertTracker {
-    pub(crate) fn new(minimum: NotifyLevel, cooldown: Duration) -> Self {
+    pub(crate) fn new(minimum: NotifyLevel, retry_interval: Duration) -> Self {
         Self {
             minimum: minimum.state(),
-            cooldown,
-            last_attempt: None,
+            retry_interval,
+            active: HashMap::new(),
+            retry_not_before: None,
         }
     }
 
-    pub(crate) fn send_if_due(
+    pub(crate) fn process(
         &mut self,
         dispatcher: &Dispatcher,
         sensors: &[Sensor],
         hostname: &str,
-    ) -> Option<DeliveryReport> {
-        self.send_if_due_at(dispatcher, sensors, hostname, Instant::now())
+    ) -> Vec<AlertDelivery> {
+        self.process_at(dispatcher, sensors, hostname, Instant::now())
     }
 
-    fn send_if_due_at(
+    fn process_at(
         &mut self,
         dispatcher: &Dispatcher,
         sensors: &[Sensor],
         hostname: &str,
         now: Instant,
-    ) -> Option<DeliveryReport> {
-        let alerting: Vec<&Sensor> = sensors
-            .iter()
-            .filter(|sensor| classify(sensor) >= self.minimum)
-            .collect();
-        if alerting.is_empty()
-            || self
-                .last_attempt
-                .is_some_and(|last| now.saturating_duration_since(last) < self.cooldown)
-        {
-            return None;
+    ) -> Vec<AlertDelivery> {
+        if self.retry_not_before.is_some_and(|retry_at| now < retry_at) {
+            return Vec::new();
         }
 
-        self.last_attempt = Some(now);
-        let notification = build_notification(&alerting, hostname);
-        Some(dispatcher.send(&notification))
+        let current: HashMap<&PathBuf, &Sensor> = sensors
+            .iter()
+            .map(|sensor| (&sensor.source, sensor))
+            .collect();
+        let overheated: Vec<Sensor> = sensors
+            .iter()
+            .filter(|sensor| {
+                classify(sensor) >= self.minimum && !self.active.contains_key(&sensor.source)
+            })
+            .cloned()
+            .collect();
+        let mut resolved: Vec<Sensor> = self
+            .active
+            .keys()
+            .filter_map(|source| current.get(source).copied())
+            .filter(|sensor| {
+                sensor.temperature_c <= threshold_for(sensor, self.minimum) - RESOLVE_HYSTERESIS_C
+            })
+            .cloned()
+            .collect();
+        resolved.sort_by(|left, right| left.label.cmp(&right.label));
+
+        let mut deliveries = Vec::new();
+        let mut failed = false;
+
+        if !overheated.is_empty() {
+            let report = dispatcher.send(&build_notification(
+                AlertKind::Overheated,
+                &overheated,
+                hostname,
+            ));
+            if report.delivered.is_empty() {
+                failed = true;
+            } else {
+                for sensor in &overheated {
+                    self.active.insert(sensor.source.clone(), sensor.clone());
+                }
+            }
+            deliveries.push(AlertDelivery {
+                kind: AlertKind::Overheated,
+                sensor_labels: labels(&overheated),
+                report,
+            });
+        }
+
+        if !resolved.is_empty() {
+            let report = dispatcher.send(&build_notification(
+                AlertKind::Resolved,
+                &resolved,
+                hostname,
+            ));
+            if report.delivered.is_empty() {
+                failed = true;
+            } else {
+                for sensor in &resolved {
+                    self.active.remove(&sensor.source);
+                }
+            }
+            deliveries.push(AlertDelivery {
+                kind: AlertKind::Resolved,
+                sensor_labels: labels(&resolved),
+                report,
+            });
+        }
+
+        self.retry_not_before = failed.then_some(now + self.retry_interval);
+        deliveries
     }
 }
 
@@ -76,16 +155,26 @@ pub(crate) fn test_notification(hostname: &str) -> Notification {
     Notification::new(
         format!("Thermal notification test: {}", plain_text(hostname, 40)),
         format!(
-            "Test notification from thermal-cli.\n\nHost: `{}`",
+            "Test notification from thermal-cli daemon mode.\n\nHost: `{}`",
             markdown_text(hostname, 80)
         ),
     )
 }
 
-fn build_notification(sensors: &[&Sensor], hostname: &str) -> Notification {
-    let title = format!("Thermal alert: {}", plain_text(hostname, 40));
+fn build_notification(kind: AlertKind, sensors: &[Sensor], hostname: &str) -> Notification {
+    let (title_prefix, introduction) = match kind {
+        AlertKind::Overheated => (
+            "Thermal alert",
+            "One or more hardware components are overheating.",
+        ),
+        AlertKind::Resolved => (
+            "Thermal resolved",
+            "Hardware temperatures returned below the alert threshold.",
+        ),
+    };
+    let title = format!("{title_prefix}: {}", plain_text(hostname, 40));
     let mut body = format!(
-        "Hardware temperature threshold reached.\n\nHost: `{}`\n\n| Sensor | Temperature | State |\n| --- | ---: | --- |\n",
+        "{introduction}\n\nHost: `{}`\n\n| Sensor | Temperature | State |\n| --- | ---: | --- |\n",
         markdown_text(hostname, 80)
     );
     for sensor in sensors {
@@ -97,6 +186,10 @@ fn build_notification(sensors: &[&Sensor], hostname: &str) -> Notification {
         ));
     }
     Notification::new(title, body)
+}
+
+fn labels(sensors: &[Sensor]) -> Vec<String> {
+    sensors.iter().map(|sensor| sensor.label.clone()).collect()
 }
 
 fn plain_text(value: &str, max_chars: usize) -> String {
@@ -119,10 +212,12 @@ fn markdown_text(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use push_notify::{Channel, DeliveryError};
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    struct RecordingChannel(Arc<Mutex<Vec<Notification>>>);
+    struct RecordingChannel {
+        received: Arc<Mutex<Vec<Notification>>>,
+        fail: bool,
+    }
 
     impl Channel for RecordingChannel {
         fn name(&self) -> &str {
@@ -130,9 +225,22 @@ mod tests {
         }
 
         fn send(&self, notification: &Notification) -> Result<(), DeliveryError> {
-            self.0.lock().unwrap().push(notification.clone());
-            Ok(())
+            self.received.lock().unwrap().push(notification.clone());
+            if self.fail {
+                Err(DeliveryError::new("test", "unavailable"))
+            } else {
+                Ok(())
+            }
         }
+    }
+
+    fn dispatcher(received: &Arc<Mutex<Vec<Notification>>>, fail: bool) -> Dispatcher {
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.add(RecordingChannel {
+            received: Arc::clone(received),
+            fail,
+        });
+        dispatcher
     }
 
     fn sensor(temperature_c: f64) -> Sensor {
@@ -146,70 +254,111 @@ mod tests {
     }
 
     #[test]
-    fn sends_only_at_or_above_requested_level() {
+    fn sends_overheat_then_resolved_for_a_component() {
         let received = Arc::new(Mutex::new(Vec::new()));
-        let mut dispatcher = Dispatcher::new();
-        dispatcher.add(RecordingChannel(Arc::clone(&received)));
+        let dispatcher = dispatcher(&received, false);
         let mut tracker = AlertTracker::new(NotifyLevel::Hot, Duration::from_secs(60));
+        let start = Instant::now();
 
-        assert!(
-            tracker
-                .send_if_due(&dispatcher, &[sensor(70.0)], "host")
-                .is_none()
+        let overheat = tracker.process_at(&dispatcher, &[sensor(85.0)], "host", start);
+        let unchanged = tracker.process_at(
+            &dispatcher,
+            &[sensor(90.0)],
+            "host",
+            start + Duration::from_secs(1),
         );
-        assert!(
-            tracker
-                .send_if_due(&dispatcher, &[sensor(85.0)], "host")
-                .is_some()
+        let within_hysteresis = tracker.process_at(
+            &dispatcher,
+            &[sensor(78.0)],
+            "host",
+            start + Duration::from_secs(2),
         );
+        let resolved = tracker.process_at(
+            &dispatcher,
+            &[sensor(74.0)],
+            "host",
+            start + Duration::from_secs(3),
+        );
+
+        assert_eq!(overheat.len(), 1);
+        assert_eq!(overheat[0].kind, AlertKind::Overheated);
+        assert!(unchanged.is_empty());
+        assert!(within_hysteresis.is_empty());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].kind, AlertKind::Resolved);
+        let notifications = received.lock().unwrap();
+        assert_eq!(notifications.len(), 2);
+        assert!(notifications[0].title().starts_with("Thermal alert"));
+        assert!(notifications[1].title().starts_with("Thermal resolved"));
+    }
+
+    #[test]
+    fn does_not_resolve_a_sensor_that_disappears() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = dispatcher(&received, false);
+        let mut tracker = AlertTracker::new(NotifyLevel::Hot, Duration::from_secs(60));
+        let start = Instant::now();
+
+        tracker.process_at(&dispatcher, &[sensor(85.0)], "host", start);
+        let deliveries =
+            tracker.process_at(&dispatcher, &[], "host", start + Duration::from_secs(1));
+
+        assert!(deliveries.is_empty());
         assert_eq!(received.lock().unwrap().len(), 1);
     }
 
     #[test]
-    fn applies_cooldown_between_attempts() {
+    fn retries_failed_alerts_after_retry_interval() {
         let received = Arc::new(Mutex::new(Vec::new()));
-        let mut dispatcher = Dispatcher::new();
-        dispatcher.add(RecordingChannel(Arc::clone(&received)));
-        let mut tracker = AlertTracker::new(NotifyLevel::Critical, Duration::from_secs(60));
+        let dispatcher = dispatcher(&received, true);
+        let mut tracker = AlertTracker::new(NotifyLevel::Hot, Duration::from_secs(60));
         let start = Instant::now();
 
-        assert!(
-            tracker
-                .send_if_due_at(&dispatcher, &[sensor(101.0)], "host", start)
-                .is_some()
+        let first = tracker.process_at(&dispatcher, &[sensor(85.0)], "host", start);
+        let throttled = tracker.process_at(
+            &dispatcher,
+            &[sensor(85.0)],
+            "host",
+            start + Duration::from_secs(59),
         );
-        assert!(
-            tracker
-                .send_if_due_at(
-                    &dispatcher,
-                    &[sensor(101.0)],
-                    "host",
-                    start + Duration::from_secs(59)
-                )
-                .is_none()
+        let retry = tracker.process_at(
+            &dispatcher,
+            &[sensor(85.0)],
+            "host",
+            start + Duration::from_secs(60),
         );
-        assert!(
-            tracker
-                .send_if_due_at(
-                    &dispatcher,
-                    &[sensor(101.0)],
-                    "host",
-                    start + Duration::from_secs(60)
-                )
-                .is_some()
-        );
+
+        assert_eq!(first.len(), 1);
+        assert!(throttled.is_empty());
+        assert_eq!(retry.len(), 1);
         assert_eq!(received.lock().unwrap().len(), 2);
     }
 
     #[test]
+    fn ignores_temperatures_below_requested_level() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = dispatcher(&received, false);
+        let mut tracker = AlertTracker::new(NotifyLevel::Hot, Duration::from_secs(60));
+
+        assert!(
+            tracker
+                .process(&dispatcher, &[sensor(70.0)], "host")
+                .is_empty()
+        );
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn escapes_markdown_table_content() {
-        let notification = build_notification(&[&sensor(101.0)], "host|`name");
+        let mut value = sensor(101.0);
+        value.label = "CPU|`Package".to_owned();
+        let notification = build_notification(AlertKind::Overheated, &[value], "host|`name");
 
         assert!(notification.body().contains("host\\|'name"));
         assert!(
             notification
                 .body()
-                .contains("| CPU Package | 101.0 °C | CRITICAL |")
+                .contains("| CPU\\|'Package | 101.0 °C | CRITICAL |")
         );
     }
 }
