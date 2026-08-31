@@ -15,7 +15,7 @@ use std::time::Duration;
 use alerts::{AlertDelivery, AlertKind, AlertTracker, NotifyLevel};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use display::{SessionPeak, Unit};
+use display::{LiveData, SessionPeak, Unit};
 use push_notify::{Dispatcher, ServerChan};
 use supports_color::Stream;
 
@@ -140,7 +140,11 @@ fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
 
     if !args.interactive {
         let sensors = discover_sensors(&args.sysfs_root)?;
-        println!("{}", display::render(&sensors, unit, color, hostname));
+        let frequency = sensors::cpu_frequency(&args.sysfs_root);
+        println!(
+            "{}",
+            display::render(&sensors, frequency.as_ref(), unit, color, hostname)
+        );
         return Ok(());
     }
 
@@ -152,6 +156,7 @@ fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
     let mut session_peak: Option<SessionPeak> = None;
     while running.load(Ordering::SeqCst) {
         let sensors = discover_sensors(&args.sysfs_root)?;
+        let frequency = sensors::cpu_frequency(&args.sysfs_root);
         let throttle = sensors::throttle_counters(&args.sysfs_root);
         throttled_since_start |=
             previous_throttle.is_some_and(|previous| throttle.increased_since(previous));
@@ -178,9 +183,12 @@ fn run_dashboard(args: &Args, hostname: &str) -> Result<()> {
                 unit,
                 color,
                 hostname,
-                &previous,
-                session_peak.as_ref(),
-                throttled_since_start,
+                LiveData {
+                    frequency: frequency.as_ref(),
+                    previous: &previous,
+                    peak: session_peak.as_ref(),
+                    throttled: throttled_since_start,
+                },
             )
         )?;
         if tty {

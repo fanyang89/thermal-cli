@@ -18,6 +18,7 @@ A polished, dependency-light hardware temperature monitor for Linux terminals.
 - Reads standard Linux `hwmon` sensors with thermal-zone fallback
 - Uses hardware thresholds while avoiding emergency limits as routine warnings
 - CPU defaults: 70 °C `WARM`, 85 °C `HOT`, hardware limit `CRITICAL`
+- Live CPU frequency range, average, policy cap, and hardware maximum
 - Color-coded state, temperature bars, and an at-a-glance summary
 - Interactive `-i` mode with deltas, session maximum, and throttle detection
 - Celsius and Fahrenheit output

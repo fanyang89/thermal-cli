@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::sensors::{Sensor, SensorKind};
+use crate::sensors::{CpuFrequency, Sensor, SensorKind};
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -22,6 +22,20 @@ pub enum Unit {
 pub(crate) struct SessionPeak {
     pub(crate) label: String,
     pub(crate) temperature_c: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LiveData<'a> {
+    pub(crate) frequency: Option<&'a CpuFrequency>,
+    pub(crate) previous: &'a HashMap<PathBuf, f64>,
+    pub(crate) peak: Option<&'a SessionPeak>,
+    pub(crate) throttled: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RenderState<'a> {
+    Snapshot { frequency: Option<&'a CpuFrequency> },
+    Live(LiveData<'a>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,8 +66,20 @@ impl TemperatureState {
     }
 }
 
-pub fn render(sensors: &[Sensor], unit: Unit, color: bool, hostname: &str) -> String {
-    render_dashboard(sensors, unit, color, hostname, None, None, false)
+pub fn render(
+    sensors: &[Sensor],
+    frequency: Option<&CpuFrequency>,
+    unit: Unit,
+    color: bool,
+    hostname: &str,
+) -> String {
+    render_dashboard(
+        sensors,
+        unit,
+        color,
+        hostname,
+        RenderState::Snapshot { frequency },
+    )
 }
 
 pub(crate) fn render_interactive(
@@ -61,19 +87,9 @@ pub(crate) fn render_interactive(
     unit: Unit,
     color: bool,
     hostname: &str,
-    previous: &HashMap<PathBuf, f64>,
-    peak: Option<&SessionPeak>,
-    throttled: bool,
+    live: LiveData<'_>,
 ) -> String {
-    render_dashboard(
-        sensors,
-        unit,
-        color,
-        hostname,
-        Some(previous),
-        peak,
-        throttled,
-    )
+    render_dashboard(sensors, unit, color, hostname, RenderState::Live(live))
 }
 
 fn render_dashboard(
@@ -81,10 +97,17 @@ fn render_dashboard(
     unit: Unit,
     color: bool,
     hostname: &str,
-    previous: Option<&HashMap<PathBuf, f64>>,
-    peak: Option<&SessionPeak>,
-    throttled: bool,
+    state: RenderState<'_>,
 ) -> String {
+    let (frequency, previous, peak, throttled) = match state {
+        RenderState::Snapshot { frequency } => (frequency, None, None, false),
+        RenderState::Live(live) => (
+            live.frequency,
+            Some(live.previous),
+            live.peak,
+            live.throttled,
+        ),
+    };
     let mut output = String::new();
     let border = |text: &str| paint(text, CYAN, color);
     let title = paint(&format!("{:<44}", "◆  THERMAL MONITOR"), BOLD, color);
@@ -105,6 +128,15 @@ fn render_dashboard(
         "├────────────────────────────────────────────────────────────────────────────┤",
     ));
     output.push('\n');
+
+    if let Some(frequency) = frequency {
+        output.push_str(&render_frequency(frequency, color));
+        output.push('\n');
+        output.push_str(&border(
+            "├────────────────────────────────────────────────────────────────────────────┤",
+        ));
+        output.push('\n');
+    }
 
     if sensors.is_empty() {
         let message = paint(
@@ -140,6 +172,32 @@ fn render_dashboard(
         "╰────────────────────────────────────────────────────────────────────────────╯",
     ));
     output
+}
+
+fn render_frequency(frequency: &CpuFrequency, color: bool) -> String {
+    let cap = if frequency.policy_max_mhz > 0.0
+        && frequency.hardware_max_mhz > frequency.policy_max_mhz + 0.5
+    {
+        format!(
+            "cap {:.0}/{:.0} MHz",
+            frequency.policy_max_mhz, frequency.hardware_max_mhz
+        )
+    } else if frequency.policy_max_mhz > 0.0 {
+        format!("cap {:.0} MHz", frequency.policy_max_mhz)
+    } else {
+        "cap unavailable".to_owned()
+    };
+    let content = format!(
+        "◇  CPU frequency  {:.0}–{:.0} MHz  ·  avg {:.0} MHz  ·  {cap}",
+        frequency.current_min_mhz, frequency.current_max_mhz, frequency.current_average_mhz,
+    );
+    let content = format!("{:<74}", truncate(&content, 74));
+    format!(
+        "{}  {}{}",
+        paint("│", CYAN, color),
+        paint(&content, BOLD, color),
+        paint("│", CYAN, color)
+    )
 }
 
 fn render_sensor(
@@ -377,13 +435,30 @@ mod tests {
 
     #[test]
     fn renders_plain_output_without_ansi_sequences() {
-        let output = render(&[sensor(52.5)], Unit::Celsius, false, "workstation");
+        let frequency = CpuFrequency {
+            current_min_mhz: 400.0,
+            current_average_mhz: 1_800.0,
+            current_max_mhz: 4_500.0,
+            policy_max_mhz: 4_500.0,
+            hardware_max_mhz: 5_400.0,
+        };
+        let output = render(
+            &[sensor(52.5)],
+            Some(&frequency),
+            Unit::Celsius,
+            false,
+            "workstation",
+        );
 
         assert!(output.contains("THERMAL MONITOR"));
+        assert!(output.contains("CPU frequency  400–4500 MHz"));
+        assert!(output.contains("avg 1800 MHz"));
+        assert!(output.contains("cap 4500/5400 MHz"));
         assert!(output.contains("CPU Package"));
         assert!(output.contains("52.5 °C"));
         assert!(output.contains("NORMAL"));
         assert!(!output.contains("\x1b["));
+        assert!(output.lines().all(|line| line.chars().count() == 78));
     }
 
     #[test]
@@ -401,9 +476,12 @@ mod tests {
             Unit::Celsius,
             false,
             "workstation",
-            &previous,
-            Some(&peak),
-            true,
+            LiveData {
+                frequency: None,
+                previous: &previous,
+                peak: Some(&peak),
+                throttled: true,
+            },
         );
 
         assert!(output.contains("↑ +1.5"));
@@ -423,9 +501,12 @@ mod tests {
             Unit::Fahrenheit,
             false,
             "workstation",
-            &previous,
-            None,
-            false,
+            LiveData {
+                frequency: None,
+                previous: &previous,
+                peak: None,
+                throttled: false,
+            },
         );
 
         assert!(output.contains("↑ +1.8"));

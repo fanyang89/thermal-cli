@@ -20,6 +20,50 @@ pub struct Sensor {
     pub source: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuFrequency {
+    pub current_min_mhz: f64,
+    pub current_average_mhz: f64,
+    pub current_max_mhz: f64,
+    pub policy_max_mhz: f64,
+    pub hardware_max_mhz: f64,
+}
+
+pub fn cpu_frequency(sysfs_root: &Path) -> Option<CpuFrequency> {
+    let root = sysfs_root.join("devices/system/cpu/cpufreq");
+    let mut current = Vec::new();
+    let mut policy_max_khz = 0_u64;
+    let mut hardware_max_khz = 0_u64;
+
+    for policy in sorted_dirs(&root).ok()? {
+        if !policy
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("policy"))
+        {
+            continue;
+        }
+        if let Some(value) = read_frequency_khz(&policy.join("scaling_cur_freq")) {
+            current.push(value);
+        }
+        policy_max_khz = policy_max_khz
+            .max(read_frequency_khz(&policy.join("scaling_max_freq")).unwrap_or_default());
+        hardware_max_khz = hardware_max_khz
+            .max(read_frequency_khz(&policy.join("cpuinfo_max_freq")).unwrap_or_default());
+    }
+
+    let current_min_khz = *current.iter().min()?;
+    let current_max_khz = *current.iter().max()?;
+    let current_average_khz = current.iter().sum::<u64>() as f64 / current.len() as f64;
+    Some(CpuFrequency {
+        current_min_mhz: current_min_khz as f64 / 1_000.0,
+        current_average_mhz: current_average_khz / 1_000.0,
+        current_max_mhz: current_max_khz as f64 / 1_000.0,
+        policy_max_mhz: policy_max_khz as f64 / 1_000.0,
+        hardware_max_mhz: hardware_max_khz as f64 / 1_000.0,
+    })
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ThrottleCounters {
     pub core_events: u64,
@@ -218,6 +262,13 @@ fn read_alarm(directory: &Path, prefix: &str) -> bool {
         .any(|suffix| read_counter(&directory.join(format!("{prefix}_{suffix}"))) > 0)
 }
 
+fn read_frequency_khz(path: &Path) -> Option<u64> {
+    read_trimmed(path)?
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+}
+
 fn read_counter(path: &Path) -> u64 {
     read_trimmed(path)
         .and_then(|value| value.parse::<u64>().ok())
@@ -318,6 +369,28 @@ mod tests {
         assert_eq!(sensors[0].label, "X86 Pkg Temp");
         assert_eq!(sensors[0].kind, SensorKind::Cpu);
         assert_eq!(sensors[0].temperature_c, 52.0);
+    }
+
+    #[test]
+    fn reads_aggregate_cpu_frequency() {
+        let root = TestDir::new();
+        let policy0 = root.0.join("devices/system/cpu/cpufreq/policy0");
+        let policy1 = root.0.join("devices/system/cpu/cpufreq/policy1");
+        fs::create_dir_all(&policy0).unwrap();
+        fs::create_dir_all(&policy1).unwrap();
+        for (policy, current) in [(&policy0, "400000\n"), (&policy1, "1800000\n")] {
+            fs::write(policy.join("scaling_cur_freq"), current).unwrap();
+            fs::write(policy.join("scaling_max_freq"), "4500000\n").unwrap();
+            fs::write(policy.join("cpuinfo_max_freq"), "5400000\n").unwrap();
+        }
+
+        let frequency = cpu_frequency(&root.0).unwrap();
+
+        assert_eq!(frequency.current_min_mhz, 400.0);
+        assert_eq!(frequency.current_average_mhz, 1_100.0);
+        assert_eq!(frequency.current_max_mhz, 1_800.0);
+        assert_eq!(frequency.policy_max_mhz, 4_500.0);
+        assert_eq!(frequency.hardware_max_mhz, 5_400.0);
     }
 
     #[test]
