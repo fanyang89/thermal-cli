@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ pub struct Sensor {
     pub high_c: Option<f64>,
     pub critical_c: Option<f64>,
     pub alarm: bool,
+    pub frequency_mhz: Option<f64>,
     pub source: PathBuf,
 }
 
@@ -64,6 +66,45 @@ pub fn cpu_frequency(sysfs_root: &Path) -> Option<CpuFrequency> {
     })
 }
 
+fn cpu_core_frequencies(sysfs_root: &Path) -> HashMap<u32, f64> {
+    let root = sysfs_root.join("devices/system/cpu");
+    let mut totals: HashMap<u32, (u64, u64)> = HashMap::new();
+    let Ok(cpus) = sorted_dirs(&root) else {
+        return HashMap::new();
+    };
+    for cpu in cpus {
+        let is_cpu = cpu
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("cpu"))
+            .is_some_and(|index| {
+                !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+            });
+        if !is_cpu {
+            continue;
+        }
+        let Some(core_id) =
+            read_trimmed(&cpu.join("topology/core_id")).and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(frequency_khz) = read_frequency_khz(&cpu.join("cpufreq/scaling_cur_freq")) else {
+            continue;
+        };
+        let total = totals.entry(core_id).or_default();
+        total.0 = total.0.saturating_add(frequency_khz);
+        total.1 += 1;
+    }
+    totals
+        .into_iter()
+        .map(|(core_id, (total, count))| (core_id, total as f64 / count as f64 / 1_000.0))
+        .collect()
+}
+
+fn core_id_from_label(label: &str) -> Option<u32> {
+    label.strip_prefix("Core ")?.trim().parse().ok()
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ThrottleCounters {
     pub core_events: u64,
@@ -105,7 +146,8 @@ pub fn throttle_counters(sysfs_root: &Path) -> ThrottleCounters {
 }
 
 pub fn discover(sysfs_root: &Path) -> io::Result<Vec<Sensor>> {
-    let hwmon = discover_hwmon(&sysfs_root.join("class/hwmon"))?;
+    let core_frequencies = cpu_core_frequencies(sysfs_root);
+    let hwmon = discover_hwmon(&sysfs_root.join("class/hwmon"), &core_frequencies)?;
     if !hwmon.is_empty() {
         return Ok(hwmon);
     }
@@ -113,7 +155,7 @@ pub fn discover(sysfs_root: &Path) -> io::Result<Vec<Sensor>> {
     discover_thermal_zones(&sysfs_root.join("class/thermal"))
 }
 
-fn discover_hwmon(root: &Path) -> io::Result<Vec<Sensor>> {
+fn discover_hwmon(root: &Path, core_frequencies: &HashMap<u32, f64>) -> io::Result<Vec<Sensor>> {
     let mut sensors = Vec::new();
     for hwmon_dir in sorted_dirs(root)? {
         let raw_device_name =
@@ -146,8 +188,16 @@ fn discover_hwmon(root: &Path) -> io::Result<Vec<Sensor>> {
                 continue;
             }
 
-            let sensor_label = read_trimmed(&hwmon_dir.join(format!("{prefix}_label")))
-                .map(|label| humanize(&label));
+            let raw_sensor_label = read_trimmed(&hwmon_dir.join(format!("{prefix}_label")));
+            let sensor_frequency = if kind == SensorKind::Cpu {
+                raw_sensor_label
+                    .as_deref()
+                    .and_then(core_id_from_label)
+                    .and_then(|core_id| core_frequencies.get(&core_id).copied())
+            } else {
+                None
+            };
+            let sensor_label = raw_sensor_label.map(|label| humanize(&label));
             let label = match sensor_label {
                 Some(label) if !label.eq_ignore_ascii_case(&device_name) => {
                     format!("{device_name} · {label}")
@@ -163,6 +213,7 @@ fn discover_hwmon(root: &Path) -> io::Result<Vec<Sensor>> {
                 high_c: read_temperature(&hwmon_dir.join(format!("{prefix}_max"))),
                 critical_c: read_temperature(&hwmon_dir.join(format!("{prefix}_crit"))),
                 alarm: read_alarm(&hwmon_dir, prefix),
+                frequency_mhz: sensor_frequency,
                 source: input,
             });
         }
@@ -194,13 +245,15 @@ fn discover_thermal_zones(root: &Path) -> io::Result<Vec<Sensor>> {
         let raw_type =
             read_trimmed(&zone.join("type")).unwrap_or_else(|| "thermal_zone".to_owned());
         let label = humanize(&raw_type);
+        let kind = sensor_kind(&raw_type);
         sensors.push(Sensor {
             label,
-            kind: sensor_kind(&raw_type),
+            kind,
             temperature_c,
             high_c: None,
             critical_c: None,
             alarm: false,
+            frequency_mhz: None,
             source: input,
         });
     }
@@ -353,6 +406,28 @@ mod tests {
         assert_eq!(sensors[0].high_c, Some(80.0));
         assert_eq!(sensors[0].critical_c, Some(100.0));
         assert!(sensors[0].alarm);
+        assert_eq!(sensors[0].frequency_mhz, None);
+    }
+
+    #[test]
+    fn maps_core_temperature_to_logical_cpu_frequency() {
+        let root = TestDir::new();
+        let hwmon = root.0.join("class/hwmon/hwmon0");
+        let cpu = root.0.join("devices/system/cpu/cpu6");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::create_dir_all(cpu.join("topology")).unwrap();
+        fs::create_dir_all(cpu.join("cpufreq")).unwrap();
+        fs::write(hwmon.join("name"), "coretemp\n").unwrap();
+        fs::write(hwmon.join("temp1_label"), "Core 8\n").unwrap();
+        fs::write(hwmon.join("temp1_input"), "52000\n").unwrap();
+        fs::write(cpu.join("topology/core_id"), "8\n").unwrap();
+        fs::write(cpu.join("cpufreq/scaling_cur_freq"), "3750000\n").unwrap();
+
+        let sensors = discover(&root.0).unwrap();
+
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(sensors[0].label, "Coretemp · Core 8");
+        assert_eq!(sensors[0].frequency_mhz, Some(3_750.0));
     }
 
     #[test]

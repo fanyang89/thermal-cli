@@ -210,11 +210,12 @@ fn render_sensor(
     let indicator = paint("●", state.color(), color);
     let (temperature, suffix) = convert(sensor.temperature_c, unit);
     let state_label = paint(&format!("{:<8}", state.label()), state.color(), color);
+    let frequency = paint(&frequency_label(sensor.frequency_mhz), DIM, color);
     let border = |text: &str| paint(text, CYAN, color);
 
     if let Some(previous) = previous {
-        let label = truncate(&sensor.label, 23);
-        let bar = temperature_bar(sensor.temperature_c, sensor.critical_c, 16);
+        let label = truncate(&sensor.label, 19);
+        let bar = temperature_bar(sensor.temperature_c, sensor.critical_c, 10);
         let colored_bar = paint(&bar, state.color(), color);
         let trend = temperature_trend(
             previous
@@ -224,33 +225,42 @@ fn render_sensor(
             color,
         );
         return format!(
-            "{}  {}  {:<23} {}  {:>6.1} {}  {}  {}  {}",
+            "{}  {}  {:<19} {}  {:>6.1} {}  {}  {}  {}  {}",
             border("│"),
             indicator,
             label,
             colored_bar,
             temperature,
             suffix,
+            frequency,
             trend,
             state_label,
             border("│")
         );
     }
 
-    let label = truncate(&sensor.label, 29);
-    let bar = temperature_bar(sensor.temperature_c, sensor.critical_c, 18);
+    let label = truncate(&sensor.label, 24);
+    let bar = temperature_bar(sensor.temperature_c, sensor.critical_c, 13);
     let colored_bar = paint(&bar, state.color(), color);
     format!(
-        "{}  {}  {:<29} {}  {:>6.1} {}  {}  {}",
+        "{}  {}  {:<24} {}  {:>6.1} {}  {}  {}  {}",
         border("│"),
         indicator,
         label,
         colored_bar,
         temperature,
         suffix,
+        frequency,
         state_label,
         border("│")
     )
+}
+
+fn frequency_label(frequency_mhz: Option<f64>) -> String {
+    match frequency_mhz {
+        Some(frequency) => format!("{:>4.0} MHz", frequency.clamp(0.0, 9_999.0)),
+        None => "       —".to_owned(),
+    }
 }
 
 fn temperature_trend(delta_c: Option<f64>, unit: Unit, color: bool) -> String {
@@ -392,6 +402,7 @@ mod tests {
             high_c: Some(80.0),
             critical_c: Some(100.0),
             alarm: false,
+            frequency_mhz: Some(3_600.0),
             source: PathBuf::from("/sys/test"),
         }
     }
@@ -456,6 +467,7 @@ mod tests {
         assert!(output.contains("cap 4500/5400 MHz"));
         assert!(output.contains("CPU Package"));
         assert!(output.contains("52.5 °C"));
+        assert!(output.contains("3600 MHz"));
         assert!(output.contains("NORMAL"));
         assert!(!output.contains("\x1b["));
         assert!(output.lines().all(|line| line.chars().count() == 78));

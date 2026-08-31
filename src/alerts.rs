@@ -284,6 +284,7 @@ mod tests {
             high_c: Some(80.0),
             critical_c: Some(100.0),
             alarm: false,
+            frequency_mhz: Some(3_600.0),
             source: PathBuf::from("/sys/test"),
         }
     }
